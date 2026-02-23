@@ -25,11 +25,14 @@ Key components:
 - compression_curriculum.py: Phase A.2 orchestration
 
 Usage:
-    # Run smoke test
-    python -m pilon_r.train --smoke-test
+    # Run PILON training
+    python -m pilon_r.train --model-size 360m --ffn-type compositional
 
-    # Run training at specific compression level
-    python -m pilon_r.train --compression-level moderate --baseline
+    # Run training with a preset compression level
+    python -m pilon_r.train --model-size 360m --compression-level moderate
+
+    # Run dense baseline training
+    python -m pilon_r.train --model-size 360m --baseline
 
     # Run full Phase A.2 compression curriculum
     python -m pilon_r.compression_curriculum --run-all

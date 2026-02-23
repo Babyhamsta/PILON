@@ -88,7 +88,7 @@ def run_single_level(
     level: str,
     output_dir: Path,
     device: str = "cuda",
-    baseline: bool = True,
+    baseline: bool = False,
 ) -> bool:
     """
     Run training for a single compression level.
@@ -121,10 +121,36 @@ def run_single_level(
         return False
 
 
+def run_dense_baseline(output_dir: Path, device: str = "cuda") -> bool:
+    """
+    Run dense baseline training used for Gate A3 ratio checks.
+    """
+    baseline_output = output_dir / "dense_baseline"
+    cmd = [
+        sys.executable, "-m", "pilon_r.train",
+        "--baseline",
+        "--output-dir", str(baseline_output),
+        "--device", device,
+    ]
+
+    print(f"\n{'='*60}")
+    print("TRAINING DENSE BASELINE")
+    print(f"Output: {baseline_output}")
+    print(f"{'='*60}")
+
+    try:
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Dense baseline training failed: {e}")
+        return False
+
+
 def run_all_levels(
     output_dir: Path,
     device: str = "cuda",
     levels: Optional[List[str]] = None,
+    run_baseline: bool = True,
 ) -> List[str]:
     """
     Run training for all compression levels sequentially.
@@ -137,6 +163,9 @@ def run_all_levels(
 
     successful = []
 
+    if run_baseline:
+        run_dense_baseline(output_dir, device)
+
     for level in levels:
         if run_single_level(level, output_dir, device):
             successful.append(level)
@@ -144,7 +173,30 @@ def run_all_levels(
     return successful
 
 
-def load_training_results(level_dir: Path, level: str) -> Optional[CompressionResult]:
+def load_baseline_ppl(output_dir: Path) -> Optional[float]:
+    """Load dense baseline validation PPL from metrics."""
+    baseline_metrics = output_dir / "dense_baseline" / "final_metrics.json"
+    if not baseline_metrics.exists():
+        return None
+    try:
+        with open(baseline_metrics, "r") as f:
+            data = json.load(f)
+        val_ppl = data.get("val_ppl", [])
+        if not val_ppl:
+            return None
+        value = float(val_ppl[-1][1])
+        if math.isfinite(value) and value > 0:
+            return value
+    except Exception:
+        return None
+    return None
+
+
+def load_training_results(
+    level_dir: Path,
+    level: str,
+    baseline_val_ppl: Optional[float] = None,
+) -> Optional[CompressionResult]:
     """Load results from a completed training run."""
     metrics_path = level_dir / "final_metrics.json"
     checkpoint_path = level_dir / "final_model.pt"
@@ -175,14 +227,18 @@ def load_training_results(level_dir: Path, level: str) -> Optional[CompressionRe
         all_final = [h[-1][1] for h in entropy_history.values() if h]
         final_entropy = sum(all_final) / len(all_final) if all_final else 0.0
 
-    # For now, use PILON PPL as baseline comparison (placeholder)
-    # In real usage, baseline would be tracked separately
-    baseline_val_ppl = final_val_ppl * 0.95  # Placeholder
-    ppl_ratio = final_val_ppl / baseline_val_ppl if baseline_val_ppl > 0 else 1.0
+    if baseline_val_ppl is not None and (not math.isfinite(baseline_val_ppl) or baseline_val_ppl <= 0):
+        baseline_val_ppl = None
+
+    ppl_ratio = float("nan")
+    if baseline_val_ppl is not None and math.isfinite(final_val_ppl):
+        ppl_ratio = final_val_ppl / baseline_val_ppl
 
     # Check Gate A3
     gate_config = GateConfig()
-    passed_a3 = final_val_ppl < gate_config.a3_max_val_ppl and ppl_ratio < gate_config.a3_max_baseline_ratio
+    ppl_ok = final_val_ppl < gate_config.a3_max_val_ppl
+    ratio_ok = math.isfinite(ppl_ratio) and ppl_ratio < gate_config.a3_max_baseline_ratio
+    passed_a3 = ppl_ok and ratio_ok
 
     # Check for SFT
     sft_path = level_dir / "sft_model.pt"
@@ -197,7 +253,7 @@ def load_training_results(level_dir: Path, level: str) -> Optional[CompressionRe
         final_val_loss=final_val_loss,
         final_val_ppl=final_val_ppl,
         final_entropy=final_entropy,
-        baseline_val_ppl=baseline_val_ppl,
+        baseline_val_ppl=baseline_val_ppl if baseline_val_ppl is not None else float("nan"),
         ppl_ratio=ppl_ratio,
         passed_gate_a3=passed_a3,
         checkpoint_path=str(checkpoint_path),
@@ -214,10 +270,13 @@ def run_sft_for_passing(output_dir: Path, device: str = "cuda", epochs: int = 2)
     print("=" * 60)
 
     passing_levels = []
+    baseline_val_ppl = load_baseline_ppl(output_dir)
+    if baseline_val_ppl is None:
+        print("WARNING: Dense baseline metrics not found. Gate A3 baseline-ratio checks are unavailable.")
 
     for level in get_all_compression_levels():
         level_dir = output_dir / level
-        result = load_training_results(level_dir, level)
+        result = load_training_results(level_dir, level, baseline_val_ppl=baseline_val_ppl)
 
         if result and result.passed_gate_a3:
             passing_levels.append(level)
@@ -262,6 +321,9 @@ def find_pareto_optimal(results: List[CompressionResult]) -> List[str]:
     """Find Pareto-optimal compression levels."""
     pareto = []
 
+    def _ratio(r: CompressionResult) -> float:
+        return r.ppl_ratio if math.isfinite(r.ppl_ratio) else float("inf")
+
     for r in results:
         is_dominated = False
         for other in results:
@@ -270,9 +332,9 @@ def find_pareto_optimal(results: List[CompressionResult]) -> List[str]:
             # other dominates r if it has both better quality AND better compression
             # Better quality = lower PPL ratio
             # Better compression = fewer primitives
-            if (other.ppl_ratio <= r.ppl_ratio and
+            if (_ratio(other) <= _ratio(r) and
                 other.n_primitives <= r.n_primitives and
-                (other.ppl_ratio < r.ppl_ratio or other.n_primitives < r.n_primitives)):
+                (_ratio(other) < _ratio(r) or other.n_primitives < r.n_primitives)):
                 is_dominated = True
                 break
 
@@ -293,18 +355,26 @@ def recommend_level(results: List[CompressionResult]) -> str:
         return best.level
     else:
         # If none pass, pick best quality
-        best = min(results, key=lambda r: r.ppl_ratio)
+        best = min(
+            results,
+            key=lambda r: (r.ppl_ratio if math.isfinite(r.ppl_ratio) else float("inf"), r.final_val_ppl),
+        )
         return best.level
 
 
 def generate_report(output_dir: Path, report_path: Optional[Path] = None) -> CompressionFrontier:
     """Generate comparison report across all compression levels."""
     results = []
+    baseline_val_ppl = load_baseline_ppl(output_dir)
+    if baseline_val_ppl is None:
+        print("WARNING: Dense baseline metrics not found. PPL ratios will be reported as NaN.")
+    else:
+        print(f"Dense baseline val_ppl: {baseline_val_ppl:.2f}")
 
     for level in get_all_compression_levels():
         level_dir = output_dir / level
         if level_dir.exists():
-            result = load_training_results(level_dir, level)
+            result = load_training_results(level_dir, level, baseline_val_ppl=baseline_val_ppl)
             if result:
                 results.append(result)
 
@@ -356,8 +426,9 @@ def print_comparison_table(results: List[CompressionResult]):
     for r in sorted_results:
         gate_status = "PASS" if r.passed_gate_a3 else "FAIL"
         sft_status = "Yes" if r.sft_completed else "No"
+        ratio_str = f"{r.ppl_ratio:.3f}" if math.isfinite(r.ppl_ratio) else "n/a"
         print(f"{r.level:>12} | {r.n_primitives:>6} | {r.rank:>4} | {r.top_k:>5} | "
-              f"{r.final_val_ppl:>8.2f} | {r.ppl_ratio:>7.3f} | {r.final_entropy:>7.2f} | "
+              f"{r.final_val_ppl:>8.2f} | {ratio_str:>7} | {r.final_entropy:>7.2f} | "
               f"{gate_status:>6} | {sft_status:>5}")
 
     print("=" * 95)
@@ -374,7 +445,8 @@ def print_frontier_analysis(frontier: CompressionFrontier):
     rec = next((r for r in frontier.results if r.level == frontier.recommended_level), None)
     if rec:
         print(f"\nRecommended '{rec.level}':")
-        print(f"  PPL ratio: {rec.ppl_ratio:.3f}")
+        ratio_str = f"{rec.ppl_ratio:.3f}" if math.isfinite(rec.ppl_ratio) else "n/a"
+        print(f"  PPL ratio: {ratio_str}")
         print(f"  Primitives: {rec.n_primitives}")
         print(f"  Entropy: {rec.final_entropy:.2f}")
         print(f"  Gate A3: {'PASS' if rec.passed_gate_a3 else 'FAIL'}")
@@ -398,6 +470,8 @@ def main():
                         help="Base output directory")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to train on")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="Skip dense baseline run when launching curriculum training")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -405,7 +479,7 @@ def main():
     if args.run_all or args.levels:
         levels = args.levels if args.levels else None
         output_dir.mkdir(parents=True, exist_ok=True)
-        successful = run_all_levels(output_dir, args.device, levels)
+        successful = run_all_levels(output_dir, args.device, levels, run_baseline=not args.no_baseline)
         print(f"\nCompleted {len(successful)}/{len(levels or get_all_compression_levels())} training runs")
 
         # Generate report

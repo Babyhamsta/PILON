@@ -236,6 +236,68 @@ class PrimitiveBank(nn.Module):
         out_flat = U @ B_cat  # (T, d_out)
         return out_flat.view(batch, seq, self.d_out)
 
+    def forward_sparse(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        top_k: int,
+        active_rank: Optional[int] = None,
+        top_indices: Optional[torch.Tensor] = None,
+        active_primitives: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Truly sparse forward: only compute selected top-k primitive outputs.
+
+        Unlike compute_all_outputs(), this never materializes non-selected
+        primitive outputs.
+        """
+        if top_k <= 0:
+            raise ValueError("top_k must be >= 1")
+
+        # Support rank scheduling
+        A = self.A[:, :, :active_rank] if active_rank is not None else self.A
+        B = self.B[:, :active_rank, :] if active_rank is not None else self.B
+        if active_rank is not None:
+            scale = self.latent_scale[:active_rank]
+            bias = self.latent_bias[:active_rank]
+        else:
+            scale = self.latent_scale
+            bias = self.latent_bias
+
+        # Support active primitive scheduling
+        if active_primitives is not None and active_primitives < self.n_primitives:
+            active_primitives = max(1, active_primitives)
+            A = A[:active_primitives]
+            B = B[:active_primitives]
+            weights = weights[:active_primitives]
+            top_k = min(top_k, active_primitives)
+
+        if top_indices is None:
+            top_weights, top_indices = torch.topk(weights, top_k, sorted=False)
+        else:
+            top_weights = weights.index_select(0, top_indices)
+            top_k = top_indices.numel()
+        top_weights = top_weights / (top_weights.sum() + 1e-8)
+
+        # Only gather the selected primitives
+        A_sel = A.index_select(0, top_indices)  # (k, d_in, r)
+        B_sel = B.index_select(0, top_indices)  # (k, r, d_out)
+
+        batch, seq, _ = x.shape
+        x_flat = x.reshape(-1, self.d_in)
+
+        # Batched sparse primitive computation over selected k
+        U = torch.einsum("td,kdr->tkr", x_flat, A_sel)  # (T, k, r)
+        if scale.dtype != U.dtype:
+            scale = scale.to(dtype=U.dtype)
+            bias = bias.to(dtype=U.dtype)
+        U.mul_(scale)
+        U.add_(bias)
+
+        Y = torch.einsum("tkr,kro->tko", U, B_sel)  # (T, k, d_out)
+        out_flat = torch.einsum("tko,k->to", Y, top_weights.to(dtype=Y.dtype))
+        return out_flat.view(batch, seq, self.d_out)
+
     def forward_fast(
         self,
         x: torch.Tensor,
@@ -266,21 +328,24 @@ class PrimitiveBank(nn.Module):
             if top_k is not None:
                 top_k = min(top_k, active_primitives)
 
-        # Get all primitive outputs: (B, S, P, d_out)
-        all_outputs = self.compute_all_outputs(x, active_rank=active_rank, active_primitives=active_primitives)
-
         n_primitives = weights.numel()
         if top_k is not None and top_k < n_primitives:
-            # Sparse: get top-k primitives and weighted sum
-            top_weights, top_indices = torch.topk(weights, top_k, sorted=False)
-            top_weights = top_weights / (top_weights.sum() + 1e-8)
-            # Gather selected primitives: (B, S, k, d_out)
-            selected = all_outputs.index_select(2, top_indices)
-            # Weighted sum: (B, S, d_out)
-            return torch.einsum("bskd,k->bsd", selected, top_weights)
-        else:
-            # Full weighted sum across all primitives
-            return torch.einsum("bspd,p->bsd", all_outputs, weights)
+            # Sparse path without materializing all primitive outputs
+            return self.forward_sparse(
+                x,
+                weights,
+                top_k=top_k,
+                active_rank=active_rank,
+                active_primitives=active_primitives
+            )
+
+        # Dense path: compute all primitive outputs once, then mix
+        all_outputs = self.compute_all_outputs(
+            x,
+            active_rank=active_rank,
+            active_primitives=active_primitives
+        )
+        return torch.einsum("bspd,p->bsd", all_outputs, weights)
 
     def _forward_loop(
         self,
@@ -627,6 +692,14 @@ class ExpertCompositionBank(nn.Module):
         fc1_weights = F.softmax(self.fc1_logits[expert_idx] / self.temperature, dim=-1)
         fc2_weights = F.softmax(self.fc2_logits[expert_idx] / self.temperature, dim=-1)
         return fc1_weights, fc2_weights
+
+    def get_fc1_logits(self) -> torch.Tensor:
+        """Get raw fc1 expert logits for top-k selection/cache updates."""
+        return self.fc1_logits
+
+    def get_fc2_logits(self) -> torch.Tensor:
+        """Get raw fc2 expert logits for top-k selection/cache updates."""
+        return self.fc2_logits
 
     def get_all_expert_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get composition weights for all experts. Shape: (n_experts, n_primitives)"""

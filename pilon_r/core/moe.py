@@ -1,9 +1,11 @@
 """
-Minimal Mixture-of-Experts (MoE) components.
+Legacy Mixture-of-Experts (MoE) components.
 
-Soft routing only (no top-k / aux loss yet).
+This module is kept for backwards compatibility and reference only.
+The active PILON MoE implementation is `core.ffn.MoECompositionalFFN`.
 """
 
+import warnings
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -41,6 +43,11 @@ class MoEFFN(nn.Module):
 
     def __init__(self, d_model: int, d_hidden: int, num_experts: int):
         super().__init__()
+        warnings.warn(
+            "pilon_r.core.moe.MoEFFN is legacy; use core.ffn.MoECompositionalFFN for active training/inference.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.router = MoERouter(d_model, num_experts)
         self.num_experts = num_experts
         self.runtime_top_k: Optional[int] = None
@@ -88,5 +95,5 @@ class MoEFFN(nn.Module):
         out_flat = torch.einsum("te,ted->td", probs_flat, expert_outputs)
         y = out_flat.view(batch, seq, d_model)
 
-        # TODO: add aux loss when MOE_AUX_LOSS_WEIGHT is enabled.
+        # Legacy API returns only model output and router probabilities.
         return y, router_probs

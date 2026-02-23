@@ -178,7 +178,7 @@ def get_360m_training_config(
     """
     effective_batch_size = micro_batch_size * gradient_accumulation
     tokens_per_step = effective_batch_size * max_seq_len
-    total_steps = total_tokens // tokens_per_step
+    total_steps = max(1, total_tokens // tokens_per_step)
 
     # Scale warmup and checkpointing based on total steps
     warmup_steps = min(500, total_steps // 10)

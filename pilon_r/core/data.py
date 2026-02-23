@@ -7,7 +7,7 @@ Alternative: TinyStories (simple, fast to train)
 """
 
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 from typing import Optional, Dict, List, Iterator, Tuple
 import os
 
@@ -82,7 +82,8 @@ class StreamingTextDataset(IterableDataset):
         skip_examples: int = 0,
         max_examples: Optional[int] = None,
         dataset_iterable: Optional[Iterator] = None,
-        dataset_config: Optional[str] = None
+        dataset_config: Optional[str] = None,
+        tokenize_batch_size: int = 32,
     ):
         """
         Initialize streaming dataset.
@@ -97,6 +98,7 @@ class StreamingTextDataset(IterableDataset):
             max_examples: Maximum examples to process (for splitting)
             dataset_iterable: Pre-loaded dataset iterator (optional)
             dataset_config: Dataset config/subset name (e.g., "sample-10BT")
+            tokenize_batch_size: Number of raw texts to tokenize together
         """
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
@@ -107,8 +109,44 @@ class StreamingTextDataset(IterableDataset):
         self.max_examples = max_examples
         self.dataset_iterable = dataset_iterable
         self.dataset_config = dataset_config
+        self.tokenize_batch_size = max(1, int(tokenize_batch_size))
+
+    def _encode_batch(self, texts: List[str]) -> List[List[int]]:
+        """
+        Tokenize a batch of texts.
+
+        Prefers vectorized tokenizer calls when available, and falls back
+        to per-item encode for compatibility with wrapper tokenizers.
+        """
+        try:
+            encoded = self.tokenizer(texts, add_special_tokens=False, truncation=False)
+            if isinstance(encoded, dict) and "input_ids" in encoded:
+                input_ids = encoded["input_ids"]
+                # Some tokenizers may return a single list for batch size 1.
+                if input_ids and isinstance(input_ids[0], int):
+                    return [input_ids]
+                return input_ids
+        except Exception:
+            pass
+        return [self.tokenizer.encode(text, add_special_tokens=False) for text in texts]
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        worker_info = get_worker_info()
+        worker_id = 0
+        num_workers = 1
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        worker_max_tokens = self.max_tokens
+        if worker_max_tokens is not None and num_workers > 1:
+            base_tokens = worker_max_tokens // num_workers
+            remainder = worker_max_tokens % num_workers
+            worker_max_tokens = base_tokens + (1 if worker_id < remainder else 0)
+            if worker_max_tokens <= 0:
+                return
+
+        dataset_sharded = False
         if self.dataset_iterable is None:
             from datasets import load_dataset
 
@@ -148,6 +186,15 @@ class StreamingTextDataset(IterableDataset):
             
             if self.max_examples is not None:
                 dataset = dataset.take(self.max_examples)
+
+            # Partition stream across dataloader workers to avoid duplicate reads.
+            if num_workers > 1 and hasattr(dataset, "shard"):
+                try:
+                    dataset = dataset.shard(num_shards=num_workers, index=worker_id)
+                    dataset_sharded = True
+                except TypeError:
+                    dataset = dataset.shard(num_workers, worker_id)
+                    dataset_sharded = True
         else:
             dataset = self.dataset_iterable
 
@@ -155,6 +202,29 @@ class StreamingTextDataset(IterableDataset):
         total_tokens = 0
         seen = 0
         yielded = 0
+        pending_texts: List[str] = []
+
+        def flush_pending(texts: List[str]) -> Iterator[Dict[str, torch.Tensor]]:
+            nonlocal buffer, total_tokens
+            if not texts:
+                return
+            token_batches = self._encode_batch(texts)
+            for tokens in token_batches:
+                buffer.extend(tokens)
+                while len(buffer) >= self.max_seq_len:
+                    # Enforce worker token budget before emitting a chunk.
+                    if worker_max_tokens is not None and (total_tokens + self.max_seq_len) > worker_max_tokens:
+                        return
+                    chunk = buffer[:self.max_seq_len]
+                    buffer = buffer[self.max_seq_len:]
+
+                    total_tokens += len(chunk)
+
+                    yield {
+                        "input_ids": torch.tensor(chunk, dtype=torch.long),
+                        "labels": torch.tensor(chunk, dtype=torch.long),
+                        "attention_mask": torch.ones(len(chunk), dtype=torch.long),
+                    }
 
         for example in dataset:
             if self.dataset_iterable is not None:
@@ -163,33 +233,37 @@ class StreamingTextDataset(IterableDataset):
                     continue
                 if self.max_examples is not None and yielded >= self.max_examples:
                     break
+                example_idx = yielded
                 seen += 1
                 yielded += 1
+                if num_workers > 1 and (example_idx % num_workers) != worker_id:
+                    continue
+            elif num_workers > 1 and not dataset_sharded:
+                # Fallback sharding for iterables that don't implement .shard().
+                if (seen % num_workers) != worker_id:
+                    seen += 1
+                    continue
+                seen += 1
             # Get text field (TinyStories uses "text")
             text = example.get("text", example.get("story", ""))
             if not text:
                 continue
 
-            # Tokenize
-            tokens = self.tokenizer.encode(text, add_special_tokens=False)
-            buffer.extend(tokens)
+            pending_texts.append(text)
+            if len(pending_texts) < self.tokenize_batch_size:
+                continue
 
-            # Yield complete sequences
-            while len(buffer) >= self.max_seq_len:
-                chunk = buffer[:self.max_seq_len]
-                buffer = buffer[self.max_seq_len:]
-
-                total_tokens += len(chunk)
-
-                yield {
-                    "input_ids": torch.tensor(chunk, dtype=torch.long),
-                    "labels": torch.tensor(chunk, dtype=torch.long),
-                    "attention_mask": torch.ones(len(chunk), dtype=torch.long)
-                }
-
-                # Check token limit
-                if self.max_tokens and total_tokens >= self.max_tokens:
+            for chunked in flush_pending(pending_texts):
+                yield chunked
+                if worker_max_tokens is not None and total_tokens >= worker_max_tokens:
                     return
+            pending_texts.clear()
+
+        # Flush trailing texts that did not fill a complete tokenization batch.
+        for chunked in flush_pending(pending_texts):
+            yield chunked
+            if worker_max_tokens is not None and total_tokens >= worker_max_tokens:
+                return
 
 
 def load_tinystories(

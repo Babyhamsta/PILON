@@ -141,6 +141,7 @@ def evaluate_with_cache(
     """
     from contextlib import nullcontext
 
+    was_training = model.training
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -153,26 +154,31 @@ def evaluate_with_cache(
     else:
         autocast_ctx = nullcontext()
 
-    with torch.no_grad():
-        for batch in eval_cache.iterate(device):
-            input_ids = batch["input_ids"]
-            labels = batch["labels"]
-            attention_mask = batch.get("attention_mask", None)
+    try:
+        with torch.no_grad():
+            for batch in eval_cache.iterate(device):
+                input_ids = batch["input_ids"]
+                labels = batch["labels"]
+                attention_mask = batch.get("attention_mask", None)
 
-            with autocast_ctx:
-                outputs = model(input_ids, labels=labels)
-                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                with autocast_ctx:
+                    outputs = model(input_ids, labels=labels)
+                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
-            # Count tokens (non-padding)
-            if attention_mask is not None:
-                n_tokens = attention_mask.sum().item()
-            else:
-                n_tokens = labels.numel()
+                # Match shifted next-token CE in model.forward with ignore_index=-100.
+                if attention_mask is not None:
+                    valid = attention_mask[:, 1:].bool() & labels[:, 1:].ne(-100)
+                    n_tokens = valid.sum().item()
+                else:
+                    n_tokens = labels[:, 1:].ne(-100).sum().item()
 
-            total_loss += loss.item() * n_tokens
-            total_tokens += n_tokens
-
-    model.train()
+                total_loss += loss.item() * n_tokens
+                total_tokens += n_tokens
+    finally:
+        if was_training:
+            model.train()
+        else:
+            model.eval()
 
     avg_loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
     perplexity = min(torch.exp(torch.tensor(avg_loss)).item(), 1e6)

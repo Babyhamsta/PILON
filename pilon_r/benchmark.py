@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -25,6 +26,27 @@ import torch.nn as nn
 from .core.config import ModelConfig
 from .core.model import PILONTransformer, create_model
 from .core.data import get_tokenizer
+
+
+def get_benchmark_autocast(device: str, precision: str):
+    """Resolve autocast context for benchmark runs."""
+    if not device.startswith("cuda"):
+        return nullcontext()
+
+    prec = (precision or "auto").lower()
+    if prec == "fp32":
+        return nullcontext()
+    if prec == "fp16":
+        return torch.autocast("cuda", dtype=torch.float16)
+    if prec == "bf16":
+        if torch.cuda.is_bf16_supported():
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+        return torch.autocast("cuda", dtype=torch.float16)
+
+    # auto
+    if torch.cuda.is_bf16_supported():
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return torch.autocast("cuda", dtype=torch.float16)
 
 
 def load_model(checkpoint_path: str, device: str = "cuda") -> tuple[PILONTransformer, ModelConfig]:
@@ -82,30 +104,15 @@ def generate_tokens(
     device = next(model.parameters()).device
     generated = input_ids.to(device)
 
-    with torch.inference_mode():
-        for _ in range(max_new_tokens):
-            # Get logits for last position
-            outputs = model(generated)
-            logits = outputs["logits"][:, -1, :]
-
-            # Apply temperature
-            if temperature != 1.0:
-                logits = logits / temperature
-
-            # Sample or argmax
-            if top_k is not None and top_k > 0:
-                # Top-k sampling
-                values, indices = torch.topk(logits, min(top_k, logits.size(-1)))
-                probs = torch.softmax(values, dim=-1)
-                next_token_idx = torch.multinomial(probs, 1)
-                next_token = indices.gather(-1, next_token_idx)
-            else:
-                # Greedy
-                next_token = logits.argmax(dim=-1, keepdim=True)
-
-            generated = torch.cat([generated, next_token], dim=1)
-
-    return generated
+    do_sample = top_k is not None and top_k > 0
+    gen_temperature = temperature if do_sample else 0.0
+    return model.generate(
+        generated,
+        max_new_tokens=max_new_tokens,
+        temperature=gen_temperature,
+        top_k=top_k if do_sample else None,
+        do_sample=do_sample,
+    )
 
 
 def benchmark_inference(
@@ -206,6 +213,7 @@ def benchmark_prefill(
     num_runs: int = 100,
     seq_lengths: List[int] = [128, 256, 512, 1024, 2048],
     batch_size: int = 1,
+    precision: str = "auto",
 ) -> Dict[str, Dict[str, float]]:
     """
     Benchmark prefill (prompt processing) performance.
@@ -236,7 +244,7 @@ def benchmark_prefill(
 
         # Warmup
         for _ in range(num_warmup):
-            with torch.inference_mode():
+            with torch.inference_mode(), get_benchmark_autocast(device, precision):
                 _ = model(input_ids)
 
         if device.startswith("cuda"):
@@ -250,7 +258,7 @@ def benchmark_prefill(
         for _ in range(num_runs):
             iter_start = time.perf_counter()
 
-            with torch.inference_mode():
+            with torch.inference_mode(), get_benchmark_autocast(device, precision):
                 _ = model(input_ids)
 
             if device.startswith("cuda"):
@@ -264,6 +272,7 @@ def benchmark_prefill(
         results[seq_len] = {
             "seq_len": seq_len,
             "batch_size": batch_size,
+            "precision": precision,
             "tokens_per_sec": total_tokens / total_time,
             "avg_latency_ms": (sum(latencies) / len(latencies)) * 1000,
             "min_latency_ms": min(latencies) * 1000,
@@ -385,6 +394,8 @@ def main():
     parser.add_argument("--prompt", type=str, default="The quick brown fox", help="Input prompt")
     parser.add_argument("--compare", type=str, default=None, help="Compare with another checkpoint")
     parser.add_argument("--prefill", action="store_true", help="Benchmark prefill instead of generation")
+    parser.add_argument("--precision", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"],
+                        help="Precision for prefill benchmark (CUDA only)")
     parser.add_argument("--output", type=str, default=None, help="Save results to JSON file")
 
     args = parser.parse_args()
@@ -437,7 +448,8 @@ def main():
                 model, config, args.device,
                 num_warmup=args.num_warmup,
                 num_runs=args.num_runs,
-                batch_size=args.batch_size
+                batch_size=args.batch_size,
+                precision=args.precision,
             )
 
             print(f"\n{'='*60}")

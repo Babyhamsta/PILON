@@ -568,17 +568,224 @@ class MoECompositionalFFN(nn.Module):
         # Cache for monitoring (set during forward)
         self._last_router_logits = None
         self._last_router_probs = None
-        # Runtime override for expert top-k (default dense routing)
-        self.runtime_top_k: Optional[int] = n_experts
+        # Runtime override for expert top-k (default: config top_k_experts).
+        self.runtime_top_k: Optional[int] = top_k_experts
+        self.runtime_step: Optional[int] = None
+        self.topk_cache_steps: Optional[int] = None
+        self._fc1_expert_topk_cache: Optional[Dict[str, torch.Tensor]] = None
+        self._fc2_expert_topk_cache: Optional[Dict[str, torch.Tensor]] = None
+        self._fc1_dense_fused_cache: Optional[Dict[str, Any]] = None
+        self._fc2_dense_fused_cache: Optional[Dict[str, Any]] = None
+
+    def update_topk_cache(self) -> None:
+        """
+        Cache per-expert primitive top-k indices for a short step window.
+        This avoids repeated top-k scans on composition weights.
+        """
+        if self.topk_cache_steps is None or self.runtime_step is None:
+            return
+
+        should_update = (self.runtime_step % self.topk_cache_steps == 0)
+        if self._fc1_expert_topk_cache is None or self._fc1_expert_topk_cache.get("step") is None:
+            should_update = True
+            if self._fc1_expert_topk_cache is None:
+                self._fc1_expert_topk_cache = {}
+            if self._fc2_expert_topk_cache is None:
+                self._fc2_expert_topk_cache = {}
+
+        if not should_update:
+            return
+
+        primitive_top_k = max(1, min(self.top_k_primitives, self.n_primitives))
+        if primitive_top_k < self.n_primitives:
+            with torch.no_grad():
+                _, fc1_idx = torch.topk(
+                    self.expert_compositions.get_fc1_logits(),
+                    primitive_top_k,
+                    dim=-1,
+                    sorted=False,
+                )
+                _, fc2_idx = torch.topk(
+                    self.expert_compositions.get_fc2_logits(),
+                    primitive_top_k,
+                    dim=-1,
+                    sorted=False,
+                )
+        else:
+            all_idx = torch.arange(self.n_primitives, device=self.expert_compositions.fc1_logits.device)
+            fc1_idx = all_idx.unsqueeze(0).expand(self.n_experts, -1)
+            fc2_idx = all_idx.unsqueeze(0).expand(self.n_experts, -1)
+
+        self._fc1_expert_topk_cache["indices"] = fc1_idx
+        self._fc1_expert_topk_cache["top_k"] = primitive_top_k
+        self._fc1_expert_topk_cache["step"] = self.runtime_step
+        self._fc2_expert_topk_cache["indices"] = fc2_idx
+        self._fc2_expert_topk_cache["top_k"] = primitive_top_k
+        self._fc2_expert_topk_cache["step"] = self.runtime_step
+
+    def _get_cached_expert_indices(
+        self,
+        scores: torch.Tensor,
+        top_k: int,
+        cache: Optional[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        if cache is not None:
+            indices = cache.get("indices")
+            cache_k = cache.get("top_k")
+            if indices is not None and cache_k == top_k:
+                return indices
+        _, indices = torch.topk(scores, top_k, dim=-1, sorted=False)
+        return indices
+
+    def _bank_forward_experts_fused(
+        self,
+        x: torch.Tensor,
+        bank: Any,
+        expert_weights: Optional[torch.Tensor],
+        expert_indices: torch.Tensor,
+        top_k: int,
+        expert_top_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Batched fused primitive-bank forward across all experts.
+
+        Args:
+            x: Expert inputs of shape (n_experts, n_tokens, d_in)
+            bank: PrimitiveBank module (fc1 or fc2)
+            expert_weights: (n_experts, n_primitives), optional if expert_top_weights provided
+            expert_indices: Top-k primitive indices per expert (n_experts, top_k)
+            top_k: Number of primitives per expert to use
+            expert_top_weights: Optional pre-gathered top-k primitive weights (n_experts, top_k)
+
+        Returns:
+            Tensor of shape (n_experts, n_tokens, d_out)
+        """
+        n_experts, n_tokens, _ = x.shape
+        rank = bank.rank
+
+        # Gather selected primitives for all experts in one pass
+        flat_idx = expert_indices.reshape(-1)
+        A_sel = bank.A.index_select(0, flat_idx).view(n_experts, top_k, bank.d_in, rank)
+        B_sel = bank.B.index_select(0, flat_idx).view(n_experts, top_k, rank, bank.d_out)
+
+        # Convert per-expert top-k mixture into a single low-rank map
+        if expert_top_weights is not None:
+            top_weights = expert_top_weights
+        else:
+            if expert_weights is None:
+                raise ValueError("expert_weights must be provided when expert_top_weights is None")
+            top_weights = expert_weights.gather(1, expert_indices)
+        top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        sqrt_w = torch.sqrt(top_weights + 1e-8).to(dtype=A_sel.dtype)
+        A_sel = A_sel * sqrt_w[:, :, None, None]
+        B_sel = B_sel * sqrt_w[:, :, None, None]
+
+        A_cat = A_sel.permute(0, 2, 1, 3).contiguous().view(n_experts, bank.d_in, top_k * rank)
+        B_cat = B_sel.contiguous().view(n_experts, top_k * rank, bank.d_out)
+
+        return self._apply_fused_maps(
+            x=x,
+            bank=bank,
+            A_cat=A_cat,
+            B_cat=B_cat,
+            top_k=top_k,
+        )
+
+    def _apply_fused_maps(
+        self,
+        x: torch.Tensor,
+        bank: Any,
+        A_cat: torch.Tensor,
+        B_cat: torch.Tensor,
+        top_k: int,
+    ) -> torch.Tensor:
+        """Apply pre-fused low-rank maps for a set of experts."""
+        n_experts, n_tokens, _ = x.shape
+        rank = bank.rank
+
+        U = torch.bmm(x, A_cat)  # (E, T, top_k * rank)
+        U = U.view(n_experts, n_tokens, top_k, rank)
+
+        scale = bank.latent_scale
+        bias = bank.latent_bias
+        if scale.dtype != U.dtype:
+            scale = scale.to(dtype=U.dtype)
+            bias = bias.to(dtype=U.dtype)
+        U.mul_(scale)
+        U.add_(bias)
+        U = U.view(n_experts, n_tokens, top_k * rank)
+        return torch.bmm(U, B_cat)  # (E, T, d_out)
+
+    def _fused_cache_bucket(self) -> int:
+        if self.topk_cache_steps is not None and self.runtime_step is not None and self.topk_cache_steps > 0:
+            return int(self.runtime_step // self.topk_cache_steps)
+        return -1
+
+    def _get_dense_fused_maps(
+        self,
+        bank: Any,
+        expert_indices: torch.Tensor,
+        expert_top_weights: torch.Tensor,
+        top_k: int,
+        cache_attr: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build (or reuse) fused expert maps for dense expert execution.
+
+        Cache is inference-only to avoid stale training graphs.
+        """
+        cache = getattr(self, cache_attr)
+        can_cache = not self.training
+        bucket = self._fused_cache_bucket()
+        device = expert_indices.device
+        dtype = bank.A.dtype
+
+        if can_cache and isinstance(cache, dict):
+            if (
+                cache.get("top_k") == top_k
+                and cache.get("bucket") == bucket
+                and cache.get("device") == str(device)
+                and cache.get("dtype") == str(dtype)
+                and cache.get("A_cat") is not None
+                and cache.get("B_cat") is not None
+            ):
+                return cache["A_cat"], cache["B_cat"]
+
+        n_experts = expert_indices.size(0)
+        rank = bank.rank
+        flat_idx = expert_indices.reshape(-1)
+        A_sel = bank.A.index_select(0, flat_idx).view(n_experts, top_k, bank.d_in, rank)
+        B_sel = bank.B.index_select(0, flat_idx).view(n_experts, top_k, rank, bank.d_out)
+
+        top_weights = expert_top_weights / (expert_top_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        sqrt_w = torch.sqrt(top_weights + 1e-8).to(dtype=A_sel.dtype)
+        A_sel = A_sel * sqrt_w[:, :, None, None]
+        B_sel = B_sel * sqrt_w[:, :, None, None]
+
+        A_cat = A_sel.permute(0, 2, 1, 3).contiguous().view(n_experts, bank.d_in, top_k * rank)
+        B_cat = B_sel.contiguous().view(n_experts, top_k * rank, bank.d_out)
+
+        if can_cache:
+            new_cache: Dict[str, Any] = {
+                "top_k": top_k,
+                "bucket": bucket,
+                "device": str(device),
+                "dtype": str(dtype),
+                "A_cat": A_cat,
+                "B_cat": B_cat,
+            }
+            setattr(self, cache_attr, new_cache)
+
+        return A_cat, B_cat
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Forward pass with MoE routing.
 
         Efficient implementation:
-        1. Precompute all primitive outputs ONCE
-        2. Route tokens to experts
-        3. Combine primitive outputs using expert composition weights
+        1. Route tokens to experts
+        2. Run expert FFNs through fused top-k primitive composition
+        3. Aggregate with router probabilities
 
         Args:
             x: Input tensor (batch, seq, d_model)
@@ -590,8 +797,6 @@ class MoECompositionalFFN(nn.Module):
             - router_logits: Router logits for monitoring (batch, seq, n_experts)
         """
         batch_size, seq_len, _ = x.shape
-        if self.runtime_top_k is None:
-            raise AssertionError("runtime_top_k must be set for MoE routing (no implicit None defaults).")
 
         # Get banks for this layer
         fc1_bank = self.primitive_banks.get_fc1_bank(self.layer_idx)
@@ -602,14 +807,17 @@ class MoECompositionalFFN(nn.Module):
         self._last_router_logits = router_logits.detach()
         router_probs = F.softmax(router_logits, dim=-1)
 
-        # Runtime top-k (None = dense routing)
+        # Runtime top-k (None falls back to config top_k_experts).
         effective_top_k = self.runtime_top_k
-        if effective_top_k is None or effective_top_k >= self.n_experts:
+        if effective_top_k is None:
+            effective_top_k = self.top_k_experts
+        effective_top_k = int(max(1, min(self.n_experts, int(effective_top_k))))
+
+        if effective_top_k >= self.n_experts:
             effective_top_k = self.n_experts
             effective_router_probs = router_probs
             expert_mask = torch.ones_like(router_probs)
             top_k_indices = None
-            top_k_probs = None
         else:
             # Select top-k experts per token and mask others
             top_k_probs, top_k_indices = torch.topk(
@@ -629,55 +837,106 @@ class MoECompositionalFFN(nn.Module):
         # Get all expert composition weights: (n_experts, n_primitives)
         fc1_expert_weights, fc2_expert_weights = self.expert_compositions.get_all_expert_weights()
 
-        # Apply top-k primitives per expert (not per token)
-        if self.top_k_primitives is not None and self.top_k_primitives < self.n_primitives:
-            fc1_vals, fc1_idx = torch.topk(fc1_expert_weights, self.top_k_primitives, dim=-1, sorted=False)
-            fc2_vals, fc2_idx = torch.topk(fc2_expert_weights, self.top_k_primitives, dim=-1, sorted=False)
+        primitive_top_k = max(1, min(self.top_k_primitives, self.n_primitives))
 
-            fc1_masked = torch.zeros_like(fc1_expert_weights)
-            fc1_masked.scatter_(-1, fc1_idx, fc1_vals)
-            fc1_expert_weights = fc1_masked / (fc1_masked.sum(dim=-1, keepdim=True) + 1e-8)
+        # Apply top-k primitives per expert (not per token).
+        if primitive_top_k < self.n_primitives:
+            fc1_idx = self._get_cached_expert_indices(
+                fc1_expert_weights, primitive_top_k, self._fc1_expert_topk_cache
+            )
+            fc2_idx = self._get_cached_expert_indices(
+                fc2_expert_weights, primitive_top_k, self._fc2_expert_topk_cache
+            )
+            fc1_top_weights = fc1_expert_weights.gather(1, fc1_idx)
+            fc2_top_weights = fc2_expert_weights.gather(1, fc2_idx)
+            fc1_top_weights = fc1_top_weights / (fc1_top_weights.sum(dim=-1, keepdim=True) + 1e-8)
+            fc2_top_weights = fc2_top_weights / (fc2_top_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        else:
+            all_idx = torch.arange(self.n_primitives, device=x.device)
+            fc1_idx = all_idx.unsqueeze(0).expand(self.n_experts, -1)
+            fc2_idx = all_idx.unsqueeze(0).expand(self.n_experts, -1)
+            fc1_top_weights = fc1_expert_weights
+            fc2_top_weights = fc2_expert_weights
 
-            fc2_masked = torch.zeros_like(fc2_expert_weights)
-            fc2_masked.scatter_(-1, fc2_idx, fc2_vals)
-            fc2_expert_weights = fc2_masked / (fc2_masked.sum(dim=-1, keepdim=True) + 1e-8)
+        # Flatten once; used by both dense and sparse expert paths.
+        n_tokens = batch_size * seq_len
+        x_flat = x.reshape(n_tokens, self.d_model)
+        router_flat = effective_router_probs.reshape(n_tokens, self.n_experts)
 
-        # Compute all primitive fc1 outputs once: (B, S, P, d_ff)
-        fc1_outputs = fc1_bank.compute_all_outputs(x)
+        if effective_top_k < self.n_experts and top_k_indices is not None:
+            # Token-grouped sparse expert execution:
+            # each active expert only processes tokens routed to it.
+            output_flat = torch.zeros(n_tokens, self.d_model, device=x.device, dtype=x.dtype)
+            active_experts = torch.unique(top_k_indices.reshape(-1), sorted=False)
 
-        if effective_top_k == self.n_experts:
-            # Dense path: compute all experts
-            h_all = torch.einsum("bspd,ep->bsed", fc1_outputs, fc1_expert_weights)
+            for expert_idx in active_experts.tolist():
+                token_weights = router_flat[:, expert_idx]
+                token_idx = torch.nonzero(token_weights > 0, as_tuple=False).squeeze(-1)
+                if token_idx.numel() == 0:
+                    continue
+
+                expert_inputs = x_flat.index_select(0, token_idx).unsqueeze(0)  # (1, T_e, d_model)
+
+                fc1_e = self._bank_forward_experts_fused(
+                    expert_inputs,
+                    fc1_bank,
+                    expert_weights=None,
+                    expert_indices=fc1_idx[expert_idx:expert_idx + 1],
+                    top_k=primitive_top_k,
+                    expert_top_weights=fc1_top_weights[expert_idx:expert_idx + 1],
+                )
+                fc1_e = self.activation(fc1_e)
+
+                fc2_e = self._bank_forward_experts_fused(
+                    fc1_e,
+                    fc2_bank,
+                    expert_weights=None,
+                    expert_indices=fc2_idx[expert_idx:expert_idx + 1],
+                    top_k=primitive_top_k,
+                    expert_top_weights=fc2_top_weights[expert_idx:expert_idx + 1],
+                ).squeeze(0)  # (T_e, d_model)
+
+                token_w = token_weights.index_select(0, token_idx).to(dtype=fc2_e.dtype).unsqueeze(-1)
+                contrib = fc2_e * token_w
+                output_flat.index_add_(0, token_idx, contrib.to(dtype=output_flat.dtype))
+        else:
+            # Dense expert execution across all experts.
+            x_expert = x_flat.unsqueeze(0).expand(self.n_experts, -1, -1)  # (E, T, d_model)
+            fc1_A_cat, fc1_B_cat = self._get_dense_fused_maps(
+                fc1_bank,
+                fc1_idx,
+                fc1_top_weights,
+                primitive_top_k,
+                cache_attr="_fc1_dense_fused_cache",
+            )
+            h_all = self._apply_fused_maps(
+                x=x_expert,
+                bank=fc1_bank,
+                A_cat=fc1_A_cat,
+                B_cat=fc1_B_cat,
+                top_k=primitive_top_k,
+            )
             h_all = self.activation(h_all)
 
-            # Compute all fc2 primitive outputs for all experts
-            h_flat = h_all.permute(0, 2, 1, 3).reshape(batch_size * self.n_experts, seq_len, self.d_ff)
-            fc2_outputs_flat = fc2_bank.compute_all_outputs(h_flat)  # (B*E, S, P, d_model)
-            fc2_outputs = fc2_outputs_flat.view(batch_size, self.n_experts, seq_len, self.n_primitives, self.d_model)
-            fc2_outputs = fc2_outputs.permute(0, 2, 1, 3, 4)  # (B, S, E, P, d_model)
+            fc2_A_cat, fc2_B_cat = self._get_dense_fused_maps(
+                fc2_bank,
+                fc2_idx,
+                fc2_top_weights,
+                primitive_top_k,
+                cache_attr="_fc2_dense_fused_cache",
+            )
+            expert_outs = self._apply_fused_maps(
+                x=h_all,
+                bank=fc2_bank,
+                A_cat=fc2_A_cat,
+                B_cat=fc2_B_cat,
+                top_k=primitive_top_k,
+            )  # (E, T, d_model)
 
-            expert_outs = torch.einsum("bsepd,ep->bsed", fc2_outputs, fc2_expert_weights)
-            output = torch.einsum("bse,bsed->bsd", effective_router_probs, expert_outs)
-        else:
-            # Sparse path: only compute top-k experts per token (vectorized)
-            # Gather expert weights for selected experts per token
-            fc1_sel = fc1_expert_weights[top_k_indices]  # (B, S, K, P)
-            fc2_sel = fc2_expert_weights[top_k_indices]  # (B, S, K, P)
+            router_dense = router_flat.transpose(0, 1).unsqueeze(-1).to(dtype=expert_outs.dtype)
+            output_flat = (expert_outs * router_dense).sum(dim=0)
 
-            # Compute fc1 outputs for selected experts: (B, S, K, d_ff)
-            h = torch.einsum("bspd,bskp->bskd", fc1_outputs, fc1_sel)
-            h = self.activation(h)
-
-            # Compute fc2 primitive outputs for selected experts
-            h_flat = h.reshape(batch_size * seq_len * effective_top_k, 1, self.d_ff)
-            fc2_outputs_flat = fc2_bank.compute_all_outputs(h_flat)  # (B*S*K, 1, P, d_model)
-            fc2_outputs = fc2_outputs_flat.reshape(
-                batch_size, seq_len, effective_top_k, self.n_primitives, self.d_model
-            )  # (B, S, K, P, d_model)
-
-            # Combine fc2 outputs with expert weights and router weights
-            expert_outs = torch.einsum("bskpd,bskp->bskd", fc2_outputs, fc2_sel)
-            output = (expert_outs * top_k_probs.unsqueeze(-1)).sum(dim=2)
+        output = output_flat.view(batch_size, seq_len, self.d_model)
 
         output = self.dropout(output)
 

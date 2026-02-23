@@ -109,8 +109,9 @@ def compute_perplexity(
             with get_autocast_context(amp_dtype, device):
                 outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
 
-            # Count non-padded tokens
-            n_tokens = attention_mask.sum().item()
+            # Match shifted CE loss with ignore_index=-100 masking.
+            valid = attention_mask[:, 1:].bool() & labels[:, 1:].ne(-100)
+            n_tokens = valid.sum().item()
             total_loss += outputs["loss"].item() * n_tokens
             total_tokens += n_tokens
             n_batches += 1

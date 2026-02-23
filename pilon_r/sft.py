@@ -654,10 +654,6 @@ def run_sft(
             if hasattr(layer.ffn, "runtime_top_k"):
                 layer.ffn.runtime_top_k = moe_cfg.top_k
 
-    # Ensure all params trainable for SFT
-    for p in model.parameters():
-        p.requires_grad = True
-
     # Training loop
     steps_per_epoch = len(dataloader)
     total_steps = config.epochs * steps_per_epoch

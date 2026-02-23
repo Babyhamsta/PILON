@@ -25,7 +25,12 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
 
-from .core.config import ModelConfig, TrainingConfig
+from .core.config import (
+    ModelConfig,
+    TrainingConfig,
+    get_compression_config,
+    get_all_compression_levels,
+)
 from .core.model import PILONTransformer, create_model, create_baseline_model
 from .core.ffn import CompositionalFFN
 from .core.data import load_text_dataset, get_tokenizer, create_dataloader
@@ -219,12 +224,27 @@ def set_primitive_requires_grad(model: PILONTransformer, requires_grad: bool) ->
 
 
 def apply_runtime_overrides(model: PILONTransformer, active_rank: int, runtime_top_k: Optional[int]) -> None:
+    def _resolve_runtime_k(ffn: nn.Module, requested_top_k: Optional[int]) -> Optional[int]:
+        if not hasattr(ffn, "n_experts"):
+            return requested_top_k
+        n_experts = int(getattr(ffn, "n_experts"))
+        default_k = getattr(ffn, "top_k_experts", None)
+        if default_k is None:
+            default_k = n_experts
+        default_k = int(max(1, min(n_experts, int(default_k))))
+        if requested_top_k is None:
+            return default_k
+        requested = int(requested_top_k)
+        if requested > n_experts:
+            return default_k
+        return int(max(1, min(n_experts, requested)))
+
     for layer in model.layers:
         ffn = layer.ffn
         if hasattr(ffn, "active_rank"):
             ffn.active_rank = active_rank
         if hasattr(ffn, "runtime_top_k"):
-            ffn.runtime_top_k = runtime_top_k
+            ffn.runtime_top_k = _resolve_runtime_k(ffn, runtime_top_k)
 
 
 def apply_runtime_overrides_extended(
@@ -236,12 +256,27 @@ def apply_runtime_overrides_extended(
     active_primitives: Optional[int],
     uniform_topk: bool
 ) -> None:
+    def _resolve_runtime_k(ffn: nn.Module, requested_top_k: Optional[int]) -> Optional[int]:
+        if not hasattr(ffn, "n_experts"):
+            return requested_top_k
+        n_experts = int(getattr(ffn, "n_experts"))
+        default_k = getattr(ffn, "top_k_experts", None)
+        if default_k is None:
+            default_k = n_experts
+        default_k = int(max(1, min(n_experts, int(default_k))))
+        if requested_top_k is None:
+            return default_k
+        requested = int(requested_top_k)
+        if requested > n_experts:
+            return default_k
+        return int(max(1, min(n_experts, requested)))
+
     for layer in model.layers:
         ffn = layer.ffn
         if hasattr(ffn, "active_rank"):
             ffn.active_rank = active_rank
         if hasattr(ffn, "runtime_top_k"):
-            ffn.runtime_top_k = runtime_top_k
+            ffn.runtime_top_k = _resolve_runtime_k(ffn, runtime_top_k)
         if hasattr(ffn, "runtime_top_k_fc1"):
             ffn.runtime_top_k_fc1 = runtime_top_k_fc1
         if hasattr(ffn, "runtime_top_k_fc2"):
@@ -448,12 +483,47 @@ def train_v2(args: argparse.Namespace) -> None:
 
     # Get model config based on size and ffn_type
     model_config = get_model_config(args.model_size, args.ffn_type)
-    if args.composition_temp is not None and model_config.ffn_type == "compositional":
-        model_config.primitive_config.temperature = args.composition_temp
-    if args.top_k_fc1 is not None and model_config.ffn_type == "compositional":
-        model_config.primitive_config.top_k_fc1 = args.top_k_fc1
-    if args.top_k_fc2 is not None and model_config.ffn_type == "compositional":
-        model_config.primitive_config.top_k_fc2 = args.top_k_fc2
+    if args.baseline:
+        model_config.ffn_type = "standard"
+
+    if model_config.ffn_type == "compositional":
+        if args.compression_level is not None:
+            compression = get_compression_config(args.compression_level)
+            model_config.primitive_config.n_primitives = compression["n_primitives"]
+            model_config.primitive_config.rank = compression["rank"]
+            model_config.primitive_config.top_k = compression["top_k"]
+            model_config.primitive_config.top_k_fc1 = compression["top_k"]
+            model_config.primitive_config.top_k_fc2 = compression["top_k"]
+
+        if args.n_primitives is not None:
+            model_config.primitive_config.n_primitives = args.n_primitives
+        if args.rank is not None:
+            model_config.primitive_config.rank = args.rank
+        if args.top_k is not None:
+            model_config.primitive_config.top_k = args.top_k
+            if args.top_k_fc1 is None:
+                model_config.primitive_config.top_k_fc1 = args.top_k
+            if args.top_k_fc2 is None:
+                model_config.primitive_config.top_k_fc2 = args.top_k
+        if args.top_k_fc1 is not None:
+            model_config.primitive_config.top_k_fc1 = args.top_k_fc1
+        if args.top_k_fc2 is not None:
+            model_config.primitive_config.top_k_fc2 = args.top_k_fc2
+        if args.composition_temp is not None:
+            model_config.primitive_config.temperature = args.composition_temp
+
+        pc = model_config.primitive_config
+        pc.n_primitives = max(1, int(pc.n_primitives))
+        pc.rank = max(1, int(pc.rank))
+        pc.top_k = int(max(1, min(pc.n_primitives, int(pc.top_k))))
+        if pc.top_k_fc1 is None:
+            pc.top_k_fc1 = pc.top_k
+        else:
+            pc.top_k_fc1 = int(max(1, min(pc.n_primitives, int(pc.top_k_fc1))))
+        if pc.top_k_fc2 is None:
+            pc.top_k_fc2 = pc.top_k
+        else:
+            pc.top_k_fc2 = int(max(1, min(pc.n_primitives, int(pc.top_k_fc2))))
 
     # Override sequence length if specified
     if args.seq_len is not None:
@@ -586,11 +656,22 @@ def train_v2(args: argparse.Namespace) -> None:
     scaler = GradScaler(enabled=use_scaler)
 
     # Schedule params (only for compositional)
+    is_moe = False
+    router_n_experts = 1
+    router_top_k_final = 1
     if is_compositional:
+        moe_cfg = model_config.primitive_config.moe_config
+        is_moe = moe_cfg is not None
         n_primitives = model_config.primitive_config.n_primitives
         top_k_final = model_config.primitive_config.top_k
         top_k_final_fc1 = model_config.primitive_config.top_k_fc1 or top_k_final
         top_k_final_fc2 = model_config.primitive_config.top_k_fc2 or top_k_final
+        if is_moe:
+            router_n_experts = max(1, int(moe_cfg.n_experts))
+            router_top_k_final = int(max(1, min(router_n_experts, int(moe_cfg.top_k))))
+        else:
+            router_n_experts = n_primitives
+            router_top_k_final = top_k_final
         rank_final = model_config.primitive_config.rank
         rank_start = args.rank_start or max(8, rank_final // 4)
         rank_mid = args.rank_mid or max(rank_start, int(round(rank_final * 0.75)))
@@ -599,6 +680,8 @@ def train_v2(args: argparse.Namespace) -> None:
         top_k_final = 1
         top_k_final_fc1 = 1
         top_k_final_fc2 = 1
+        router_n_experts = 1
+        router_top_k_final = 1
         rank_final = 1
         rank_start = 1
         rank_mid = 1
@@ -653,7 +736,12 @@ def train_v2(args: argparse.Namespace) -> None:
     comp_lr_mult = args.comp_lr_mult
 
     step_time = time.time()
-    last_log_step = -1
+    tokens_since_log = 0
+    grad_accum_steps = max(1, int(train_config.gradient_accumulation))
+    moe_aux_loss_weight = 0.0
+    if is_compositional and model_config.primitive_config.moe_config is not None:
+        moe_aux_loss_weight = float(model_config.primitive_config.moe_config.aux_loss_weight)
+
     for step in range(start_step, train_config.total_steps):
         data_s = 0.0
         fwd_s = 0.0
@@ -670,14 +758,17 @@ def train_v2(args: argparse.Namespace) -> None:
         runtime_top_k = get_runtime_top_k(
             step,
             train_config.total_steps,
-            n_primitives,
-            top_k_final,
+            router_n_experts,
+            router_top_k_final,
             args.top_k_mid,
             phase1_frac,
             phase2_frac,
             phase1_sparse=args.phase1_sparse,
             phase1_top_k=args.phase1_top_k
         )
+        if is_moe and runtime_top_k is None:
+            # In MoE, phase-1 "full mix" means using all experts.
+            runtime_top_k = router_n_experts
         runtime_top_k_fc1 = get_runtime_top_k(
             step,
             train_config.total_steps,
@@ -771,106 +862,157 @@ def train_v2(args: argparse.Namespace) -> None:
             for group in optimizer.param_groups:
                 group["lr"] = base_lr
 
-        # Get batch
-        if log_timing:
-            data_start = time.perf_counter()
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+        tokens_in_step = 0
+        lm_loss_accum = 0.0
+        distill_loss_accum = 0.0
+        distill_loss_count = 0
+        comp_entropy_loss_accum = 0.0
+        comp_entropy_loss_count = 0
+        aux_loss_raw_accum = 0.0
+        aux_loss_scaled_accum = 0.0
+        aux_loss_count = 0
+        grad_norm_value = 0.0
 
-        if log_timing:
-            sync_if_cuda(device)
-            data_s = time.perf_counter() - data_start
+        optimizer.zero_grad(set_to_none=True)
+        for _ in range(grad_accum_steps):
+            # Get micro-batch
+            if log_timing:
+                data_start = time.perf_counter()
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
 
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        labels = batch["labels"].to(device, non_blocking=True)
-
-        # Forward
-        if log_timing:
-            sync_if_cuda(device)
-            fwd_start = time.perf_counter()
-        with get_autocast_context(amp_dtype, device):
-            outputs = model(input_ids, labels=labels)
-            lm_loss = outputs["loss"]
-            total_loss = lm_loss
-
-            distill_loss = None
-            if teacher is not None and scaffold_alpha > 0.0:
-                with torch.no_grad():
-                    teacher_out = teacher(input_ids)
-                student_logits = outputs["logits"][:, :-1, :].contiguous()
-                teacher_logits = teacher_out["logits"][:, :-1, :].contiguous()
-                distill_loss = kl_divergence(student_logits, teacher_logits, temperature=args.distill_temp)
-                total_loss = total_loss + scaffold_alpha * distill_loss
-
-            comp_entropy_loss = None
-            if is_compositional and comp_entropy_weight > 0 and phase >= 2:
-                comp_entropy_loss = compute_composition_entropy_loss(raw_model)
-                if comp_entropy_loss is not None:
-                    total_loss = total_loss + comp_entropy_weight * comp_entropy_loss
-
-        if log_timing:
-            sync_if_cuda(device)
-            fwd_s = time.perf_counter() - fwd_start
-
-        # Backward
-        total_loss = total_loss / train_config.gradient_accumulation
-        if log_timing:
-            sync_if_cuda(device)
-            bwd_start = time.perf_counter()
-        if use_scaler:
-            scaler.scale(total_loss).backward()
-        else:
-            total_loss.backward()
-
-        if log_timing:
-            sync_if_cuda(device)
-            bwd_s = time.perf_counter() - bwd_start
-
-        if (step + 1) % train_config.gradient_accumulation == 0:
             if log_timing:
                 sync_if_cuda(device)
-                opt_start = time.perf_counter()
+                data_s += time.perf_counter() - data_start
+
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            tokens_in_step += input_ids.numel()
+
+            # Forward
+            if log_timing:
+                sync_if_cuda(device)
+                fwd_start = time.perf_counter()
+            with get_autocast_context(amp_dtype, device):
+                outputs = model(input_ids, labels=labels)
+                lm_loss = outputs["loss"]
+                total_loss = lm_loss
+
+                aux_loss_tensor = None
+                aux_candidate = outputs.get("aux_loss")
+                if aux_candidate is not None:
+                    if not torch.is_tensor(aux_candidate):
+                        aux_candidate = lm_loss.new_tensor(float(aux_candidate))
+                    aux_loss_tensor = aux_candidate.to(dtype=lm_loss.dtype)
+                    if moe_aux_loss_weight > 0.0:
+                        total_loss = total_loss + moe_aux_loss_weight * aux_loss_tensor
+
+                distill_loss = None
+                if teacher is not None and scaffold_alpha > 0.0:
+                    with torch.no_grad():
+                        teacher_out = teacher(input_ids)
+                    student_logits = outputs["logits"][:, :-1, :].contiguous()
+                    teacher_logits = teacher_out["logits"][:, :-1, :].contiguous()
+                    distill_loss = kl_divergence(student_logits, teacher_logits, temperature=args.distill_temp)
+                    total_loss = total_loss + scaffold_alpha * distill_loss
+
+                comp_entropy_loss = None
+                if is_compositional and comp_entropy_weight > 0 and phase >= 2:
+                    comp_entropy_loss = compute_composition_entropy_loss(raw_model)
+                    if comp_entropy_loss is not None:
+                        total_loss = total_loss + comp_entropy_weight * comp_entropy_loss
+
+            if log_timing:
+                sync_if_cuda(device)
+                fwd_s += time.perf_counter() - fwd_start
+
+            lm_loss_accum += float(lm_loss.detach().item())
+            if distill_loss is not None:
+                distill_loss_accum += float(distill_loss.detach().item())
+                distill_loss_count += 1
+            if comp_entropy_loss is not None:
+                comp_entropy_loss_accum += float(comp_entropy_loss.detach().item())
+                comp_entropy_loss_count += 1
+            if aux_loss_tensor is not None:
+                aux_raw = float(aux_loss_tensor.detach().item())
+                aux_loss_raw_accum += aux_raw
+                aux_loss_scaled_accum += moe_aux_loss_weight * aux_raw
+                aux_loss_count += 1
+
+            # Backward
+            total_loss = total_loss / grad_accum_steps
+            if log_timing:
+                sync_if_cuda(device)
+                bwd_start = time.perf_counter()
             if use_scaler:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
-            if use_scaler:
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(total_loss).backward()
             else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
 
             if log_timing:
                 sync_if_cuda(device)
-                opt_s = time.perf_counter() - opt_start
+                bwd_s += time.perf_counter() - bwd_start
+
+        if log_timing:
+            sync_if_cuda(device)
+            opt_start = time.perf_counter()
+        if use_scaler:
+            scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
+        grad_norm_value = float(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
+        if use_scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        if log_timing:
+            sync_if_cuda(device)
+            opt_s = time.perf_counter() - opt_start
 
         if log_timing:
             sync_if_cuda(device)
             step_s = time.perf_counter() - step_start
+
+        lm_loss_value = lm_loss_accum / max(1, grad_accum_steps)
+        distill_loss_value = (
+            distill_loss_accum / distill_loss_count if distill_loss_count > 0 else None
+        )
+        comp_entropy_loss_value = (
+            comp_entropy_loss_accum / comp_entropy_loss_count if comp_entropy_loss_count > 0 else None
+        )
+        aux_loss_raw_value = (
+            aux_loss_raw_accum / aux_loss_count if aux_loss_count > 0 else None
+        )
+        aux_loss_scaled_value = (
+            aux_loss_scaled_accum / aux_loss_count if aux_loss_count > 0 else None
+        )
+        tokens_since_log += tokens_in_step
 
         # Logging
         if step % train_config.log_every == 0:
             now = time.time()
             step_dt = max(1e-6, now - step_time)
             step_time = now
-            steps_since = max(1, step - last_log_step)
-            last_log_step = step
-            tokens = input_ids.numel()
-            tok_s = (tokens * steps_since) / step_dt
-            tok_s_effective = tok_s * train_config.gradient_accumulation
+            tok_s = tokens_since_log / step_dt
+            tokens_since_log = 0
+            tok_s_effective = tok_s
 
             # Calculate total tokens processed
-            tokens_per_step = train_config.micro_batch_size * train_config.max_seq_len * train_config.gradient_accumulation
-            tokens_processed = step * tokens_per_step
+            tokens_per_step = (
+                train_config.micro_batch_size * train_config.max_seq_len * grad_accum_steps
+            )
+            tokens_processed = (step + 1) * tokens_per_step
 
             # Wall clock time
             wall_clock_hours = (time.time() - training_start_time) / 3600
 
             log_dict = {
-                "train_loss": lm_loss.item(),
+                "train_loss": lm_loss_value,
                 "tokens_sec": tok_s,
                 "tokens_sec_effective": tok_s_effective,
                 "wall_clock_hours": wall_clock_hours,
@@ -886,7 +1028,7 @@ def train_v2(args: argparse.Namespace) -> None:
                 log_dict.update({
                     "scaffold_alpha": scaffold_alpha,
                     "active_rank": float(active_rank),
-                    "top_k": float(runtime_top_k or n_primitives),
+                    "top_k": float(runtime_top_k if runtime_top_k is not None else router_n_experts),
                     "top_k_fc1": float(runtime_top_k_fc1 or n_primitives),
                     "top_k_fc2": float(runtime_top_k_fc2 or n_primitives),
                     "active_primitives": float(active_primitives or n_primitives),
@@ -906,8 +1048,8 @@ def train_v2(args: argparse.Namespace) -> None:
                         log_dict["topk_utilization"] = comp_stats.get("comp_max_w", 0.0)
                         log_dict.update(comp_stats)
 
-                if comp_entropy_loss is not None:
-                    log_dict["comp_entropy_loss"] = comp_entropy_loss.item()
+                if comp_entropy_loss_value is not None:
+                    log_dict["comp_entropy_loss"] = comp_entropy_loss_value
                     log_dict["comp_entropy_weight"] = comp_entropy_weight
 
             if log_timing:
@@ -919,11 +1061,15 @@ def train_v2(args: argparse.Namespace) -> None:
                     "step_s": step_s,
                 })
                 if step_s > 0:
-                    log_dict["tok_s_step"] = tokens / step_s
-                    log_dict["tok_s_step_eff"] = (tokens * train_config.gradient_accumulation) / step_s
+                    log_dict["tok_s_step"] = tokens_in_step / step_s
+                    log_dict["tok_s_step_eff"] = tokens_in_step / step_s
 
-            if distill_loss is not None:
-                log_dict["distill"] = distill_loss.item()
+            if distill_loss_value is not None:
+                log_dict["distill"] = distill_loss_value
+            if aux_loss_raw_value is not None:
+                log_dict["aux_loss"] = aux_loss_raw_value
+                log_dict["aux_loss_scaled"] = aux_loss_scaled_value
+                log_dict["aux_loss_weight"] = moe_aux_loss_weight
 
             # Enhanced VRAM tracking
             if device.startswith("cuda"):
@@ -933,15 +1079,10 @@ def train_v2(args: argparse.Namespace) -> None:
                 # Reset peak stats for next interval
                 torch.cuda.reset_peak_memory_stats()
 
-            # Gradient norm (compute if not already available)
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    total_norm += p.grad.data.norm(2).item() ** 2
-            log_dict["grad_norm"] = total_norm ** 0.5
+            log_dict["grad_norm"] = grad_norm_value
 
             logger.metric(step, log_dict)
-            metrics.add_train_loss(step, lm_loss.item())
+            metrics.add_train_loss(step, lm_loss_value)
 
         # Eval
         if step % train_config.eval_every == 0:
@@ -973,7 +1114,7 @@ def train_v2(args: argparse.Namespace) -> None:
             logger.info(f"step {step} val_loss={avg_val:.4f} val_ppl={val_ppl:.2f}")
 
         # Checkpoint
-        if step % train_config.save_every == 0 and step > 0:
+        if train_config.save_every > 0 and step % train_config.save_every == 0 and step > 0:
             ckpt_path = output_dir / f"checkpoint_step_{step}.pt"
             save_checkpoint(ckpt_path, model, optimizer, step, train_config, scaler)
             metrics.save(output_dir / "metrics.json")
@@ -1029,6 +1170,12 @@ def main() -> None:
                         help="Model size (48m, 360m, or 500m)")
     parser.add_argument("--ffn-type", type=str, choices=["compositional", "standard"], default="compositional",
                         help="FFN type (compositional for PILON, standard for dense)")
+    parser.add_argument("--baseline", action="store_true", help="Alias for --ffn-type standard")
+    parser.add_argument("--compression-level", type=str, choices=get_all_compression_levels(), default=None,
+                        help="Apply preset n_primitives/rank/top_k from compression config")
+    parser.add_argument("--n-primitives", type=int, default=None, help="Override number of primitives")
+    parser.add_argument("--rank", type=int, default=None, help="Override primitive rank")
+    parser.add_argument("--top-k", type=int, default=None, help="Override shared top-k for compositional FFN")
     parser.add_argument("--tokenizer-path", type=str, default=None,
                         help="Path to custom tokenizer (default: GPT-2)")
     parser.add_argument("--total-tokens", type=int, default=None,
