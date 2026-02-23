@@ -1,0 +1,20 @@
+# PILON-R Phase A Requirements
+
+# Core deep learning
+torch>=2.0.0
+transformers>=4.30.0
+
+# Datasets
+datasets>=2.14.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Analysis (optional)
+matplotlib>=3.7.0
+
+# Development
+pytest>=7.0.0
+black>=23.0.0
+isort>=5.12.0

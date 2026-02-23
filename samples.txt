@@ -1,0 +1,215 @@
+PILON-R GENERATION SAMPLES
+================================================================================
+
+Sample 1
+----------------------------------------
+Prompt: ### Instruction:
+Hi there!
+
+### Response:
+
+
+PILON Generation:
+1. The answer to the answer is that the question is not at least one, but it is not a certain problem.
+2. The answer is that the answer to a question is the same as the answer to the question.
+3. The answer is that the question is not at least one, but it has a very least one other to say the question, even though the question cannot be at least one or not a question.
+6. The answer is that the question asks to be in that one question. This means that the answer is a least one of the question, not at least one of the question or then the question is true.
+6. The answer does not be the question, not even though the answer is not at least one of the question.
+6. The answer is that the question asks for a question.
+6. The answer is that the answer is not a true answer.
+
+
+Sample 2
+----------------------------------------
+Prompt: ### Instruction:
+What is the capital of France?
+
+### Response:
+
+
+PILON Generation:
+The capital of France is the first-known French French capital of France. The capital of France is the British capital of France, the French capital of France, France, and the French capital of France. The French French capital of France is the central Paris of France. The Londonian Paris is the French Italian capital of London, and France.
+
+The French France is a capital of France, and the French French capital for the French capital. In the early French French London, France, the French capital for France, France, and the French capital of France.
+
+The French Paris for France is the French France of France, French French France, France, and France, London, France (1914). The French Empire has one of its greatest French France, and French France in London.
+
+The French capital for France:
+18 French France is the Italian Revolution, England, France, France, and France.
+
+(18) France France (18)
+
+1818 France French French London, France, France, France, France, France, France, and France.
+
+181618 French French France (1718)
+181818 French English France
+1840 British France France France, France - French
+
+
+Sample 3
+----------------------------------------
+Prompt: ### Instruction:
+Write a short poem about the moon.
+
+### Response:
+
+
+PILON Generation:
+Ah,
+The moon is a heart that makes it a world,
+That's a day,
+Yet in the heart that
+In the moon,
+In the sun,
+And the night, the night,
+Their night's night,
+And as a heart,
+And the night.
+With a heart,
+With light,
+And as we know,
+And the night, the night,
+And the night,
+And every night, the night,
+And so the heart is the day.
+That's the night,
+And the night,
+And the night,
+And the night, the night,
+And the night, the night,
+And the night,
+And the night, the night.
+And the night, the moon,
+And so the night,
+And the night, the night,
+And the stars,
+And night, the night, the night,
+And the moon, so the day's life,
+And the night.
+And the night, the night,
+And their moon, the moon,
+And the night, the moon,
+And night.
+And the night, the night,
+And the night, the night,
+And the night,
+And the
+
+
+Sample 4
+----------------------------------------
+Prompt: ### Instruction:
+Explain what a neural network is in simple terms.
+
+### Response:
+
+
+PILON Generation:
+To solve the communication system, we need to find out how many people are in complex form and then subtract them together.
+
+In general, we first need to find out how many people are in complex form.
+
+Here's the reasoning:
+
+1. You need to find out how many people are in complex form, so there is a number of people in the form.
+3. If you are in complex form, then you need to find out how many people are in complex form.
+4. The number of people are in the form of a single group is the number of people in the form of people in the form.
+5. If you are in an example, the number of people are in the form of people in the form, then you have the number of people in the form.
+5. If you are in an example, the number of people are in the form of a single group, and the number of people are in the form.
+
+5. The number of people are in the form of a single group is 3, so it is 1, and the number of people are in the form.
+
+5. If you are in the form, you have the number of people in the form, it is
+
+
+Sample 5
+----------------------------------------
+Prompt: ### Instruction:
+Tell me a joke.
+
+### Response:
+
+
+PILON Generation:
+Why don't you know you're getting out? Because they're trying to share the truth in this place.
+
+
+Sample 6
+----------------------------------------
+Prompt: ### Instruction:
+What are three tips for staying healthy?
+
+### Response:
+
+
+PILON Generation:
+To find the total number of calories that contribute to healthy, we need to find the total number of calories that contribute to healthy habits.
+
+The number of calories that contribute to healthy healthy lives is 2. However, this can be done by taking out of the most possible steps.
+
+So, the total number of calories that contribute to healthy lives is 2.
+The number of calories that contribute to healthy life is 5.
+The number of calories that contribute to healthy choices is 2.
+There are 4 grams of glucose that contribute to healthy outcomes.
+The number of calories to healthy life is 1, which is 4.5 grams of glucose that contribute to healthy life is 2.5 grams of insulin that contribute to healthy life is 3.6 grams of glucose.
+
+Therefore, the total number of calories that contribute to healthy life is 5.6 grams of cholesterol that contribute to healthy lives is 2.5 grams of glucose.
+
+
+Sample 7
+----------------------------------------
+Prompt: ### Instruction:
+Summarize the story of Cinderella in two sentences.
+
+### Response:
+
+
+PILON Generation:
+Badieship
+Bodies the story of the story of a novel,
+Bogs in the early morning,
+A tale of the heart of the heart of the world,
+A story of the world.
+Biles, the story of the story of a year,
+Bbles, and the heart of the story of the life.
+Badies, we get the story of the story,
+Biles, each book of the story,
+A story of the story of the world,
+A story of the story of the story,
+Buses and the story of the world.
+
+A story of the story of the story,
+Bons,
+Bogs,
+A story of the story,
+Bacles,
+A story of the story of the story.
+Bons,
+A tale of the story of the story,
+A story of the story,
+B stories of the story of the story,
+Bakes, the story of the story of the story,
+B story of the story,
+A story of the story of the story of the story,
+B stories of the story of the story of the story of the story of the story,
+Buses,
+Bonding characters, the story
+
+
+Sample 8
+----------------------------------------
+Prompt: ### Instruction:
+Why is the sky blue?
+
+### Response:
+
+
+PILON Generation:
+The sky, a wind, the clouds, the sky, the sun, the night, the light, and the sun, the night, the sun, the stars, and the sun, the star and the Earth.
+
+
+================================================================================
+QUALITY SCORES
+================================================================================
+
+PILON average quality: 0.91

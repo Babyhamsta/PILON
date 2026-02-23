@@ -1,0 +1,15 @@
+python -m pilon_r.train --output-dir outputs/phase_b_sparse_diag --device cuda --log-timing --log-comp-stats --phase1-sparse --phase1-top-k 4 --topk-cache-steps 10 --freeze-primitives-phase2 --composition-temp 0.5
+
+python -m pilon_r.train --output-dir outputs/phase_b_sparse_diag2 --device cuda --log-timing --log-comp-stats --phase1-sparse --phase1-top-k 4 --topk-cache-steps 0 --freeze-primitives-phase2 --composition-temp 0.5
+
+python -m pilon_r.train --output-dir outputs/phase_b_sparse_diag3 --device cuda --log-timing --log-comp-stats --phase1-sparse --phase1-top-k 4 --topk-cache-steps 0 --freeze-primitives-phase2 --composition-temp 0.5 --comp-lr-mult 4.0 --comp-entropy-weight 0.001
+
+python -m pilon_r.sft outputs/phase_b_sparse_final/final_model.pt --epochs 2 --output-dir outputs/phase_b_sparse_final_sft --device cuda
+
+python -m analysis.generation_samples outputs/phase_b_sparse_final_sft/sft_model.pt --device cuda --eval-top-k 8 --log-speed --interactive
+
+python -m pilon_r.train --output-dir outputs/360m_pilon --model-size 360m --ffn-type compositional --total-tokens 1000000000 --device cuda --phase1-sparse --phase1-top-k 4 --freeze-primitives-phase2 --comp-lr-mult 4.0 --comp-entropy-weight 0.001 --log-timing --log-comp-stats
+
+python -m pilon_r.train --output-dir outputs/48m_pilon --device cuda --total-tokens 1000000000 --phase1-sparse --phase1-top-k 4 --freeze-primitives-phase2 --comp-lr-mult 4.0 --comp-entropy-weight 0.001 --log-timing --log-comp-stats
+
+python -m pilon_r.train --output-dir outputs/48m_dense --ffn-type standard --device cuda --total-tokens 1000000000 --log-timing
