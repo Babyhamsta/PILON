@@ -1,7 +1,8 @@
 # PILON-R Improvement Plan: Exploiting What Makes PILON Different
 
 **Date:** February 23, 2026  
-**Status:** Phase B Complete → Phase B.5 (Structural Advantages)  
+**Status:** Phase B Complete -> Phase B.5 (Structural Advantages)  
+**Progress:** B.5a complete (compute path fixes landed and validated on February 23, 2026).  
 **Hardware:** RTX 4070 (12GB VRAM)
 
 ---
@@ -53,6 +54,7 @@ The training loop (train.py) logs VRAM but doesn't compare it against the dense 
 ### Phase B.5a: Fix the Compute Path (Days 1-2)
 
 **Goal:** Make PILON's actual FLOPS match its theoretical FLOPS.
+**Status:** DONE (completed February 23, 2026).
 
 Right now, top-k=8 with 48 primitives should do 8/48 = 16.7% of the compute. It actually does 100% because of `compute_all_outputs()`. Fix this first because every subsequent measurement is wrong until this is fixed.
 
@@ -385,7 +387,7 @@ python -m pilon_r.train --model-size 360m --ffn-type compositional \
 
 | Phase | Question | If YES | If NO |
 |-------|----------|--------|-------|
-| B.5a: Compute fix | Is PILON wasting FLOPS? | tok/s jumps, confirms overhead was artificial | Overhead is elsewhere (memory bandwidth?) |
+| B.5a: Compute fix (DONE) | Is PILON wasting FLOPS? | tok/s jumps, confirms overhead was artificial | Overhead is elsewhere (memory bandwidth?) |
 | B.5b: Tiered loading | Can PILON use less VRAM? | Core structural advantage confirmed | Swapping overhead kills benefit |
 | B.5c: Early exit | Can PILON skip layers cheaply? | Inference speed advantage | Exit gates can't predict well enough |
 | B.5d: 360M crossover | Does PILON win on efficiency at scale? | **Thesis confirmed** — PILON is more efficient | PILON's overhead outweighs structural advantages |
