@@ -31,3 +31,6 @@ compressed_model/
 .vscode/
 .idea/
 .DS_Store
+
+# Local assistant metadata
+.claude/
