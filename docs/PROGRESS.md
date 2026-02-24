@@ -2,7 +2,7 @@
 
 **Project:** Program-Induced Linear Operator Network with Reasoning
 **Started:** January 2026
-**Last Updated:** January 31, 2026
+**Last Updated:** February 23, 2026
 
 ---
 
@@ -10,7 +10,7 @@
 
 PILON-R explores a compositional weight parameterization for transformer FFN layers. Instead of storing dense weight matrices, we use shared low-rank primitives combined via learned composition weights.
 
-**Status:** Phase B (Sparse Training) COMPLETE. SFT validated. Ready for Phase C evaluation.
+**Status:** Phase B.5 (Structural Advantages) COMPLETE. Ready for 360M crossover experiment (B.5d).
 
 ---
 
@@ -25,6 +25,11 @@ PILON-R explores a compositional weight parameterization for transformer FFN lay
 | Throughput parity with dense | ✅ Exceeded | ~200k tok/s (target was 18k+) |
 | Phase B sparse training | ✅ Complete | 97K steps, 90.9B tokens processed |
 | SFT fine-tuning | ✅ Complete | 1 epoch, decent output quality |
+| Phase B.5a compute path fix | ✅ Complete | forward_sparse avoids wasteful compute_all_outputs |
+| Phase B.5b tiered primitive banks | ✅ Complete | TieredPrimitiveBank with hot/warm tiers |
+| Phase B.5c early exit gates | ✅ Complete | ExitGate + post-hoc gate training |
+| Phase B.5d 360M crossover setup | ✅ Ready | Configs + script ready, awaiting run |
+| Phase B.5e benchmarking suite | ✅ Complete | VRAM/compute/inference/quality benchmarks |
 | Post-hoc compression of frozen models | ❌ Abandoned | Doesn't work at high compression |
 
 ---
@@ -331,6 +336,75 @@ python -m pilon_r.sft outputs/phase_b_sparse_final/final_model.pt \
 
 ---
 
+## Phase B.5: Structural Advantages ✅ COMPLETE
+
+**Goal:** Test PILON's unique structural properties that dense FFN cannot replicate.
+
+### Phase B.5a: Compute Path Fix ✅ COMPLETE
+
+Fixed `forward_sparse()` and fused expert paths to avoid wasteful `compute_all_outputs()` calls. With top_k=8 out of 48 primitives, PILON now only computes the 8 needed primitives instead of all 48.
+
+### Phase B.5b: TieredPrimitiveBank ✅ COMPLETE
+
+**New file:** `pilon_r/core/tiered_bank.py`
+
+Implemented VRAM-efficient primitive loading:
+- Only `n_hot` primitives live in VRAM with gradients and optimizer states
+- Remaining primitives stored in CPU pinned memory (no gradients)
+- Usage-based hot/warm swapping at configurable intervals
+- Adam optimizer state transfer during swaps (zero for promoted warm primitives)
+- Explicit `warm_indices` buffer prevents corruption after multiple swaps
+- Vectorized `_global_to_hot_indices` avoids GPU sync
+
+**Key properties:**
+- Duck-types `PrimitiveBank` (same forward interface)
+- Supports all forward variants: `forward()`, `forward_topk_fused()`, `forward_sparse()`, `forward_fast()`
+- Degenerate case (n_hot = n_primitives) produces identical outputs to PrimitiveBank
+
+### Phase B.5c: Early Exit for Easy Tokens ✅ COMPLETE
+
+**New file:** `pilon_r/core/early_exit.py`
+
+Implemented inference-time FFN skipping:
+- `ExitGate`: lightweight `Linear(d_model, 1) + Sigmoid`, bias=-2.0 (conservative start)
+- During inference: tokens skip FFN if gate confidence > threshold
+- Mixed-skip batch handling: gather non-skip tokens, run FFN, scatter back
+- Post-hoc gate training via KL divergence between intermediate and final logits
+- `EarlyExitMetrics`: tracks skip_counts and avg_layers_per_token per layer
+- Gate training properly saves/restores `requires_grad` on all parameters
+- Attention mask propagation in gate training forward loop
+
+### Phase B.5d: 360M Crossover Experiment ✅ READY
+
+**New file:** `scripts/run_360m_crossover.sh`
+
+Four configs head-to-head on 1B tokens:
+1. Dense-360M: standard FFN baseline
+2. PILON-360M-full: compositional, all primitives in VRAM
+3. PILON-360M-tiered: compositional with n_hot=16
+4. PILON-360M-exit: tiered + post-hoc gate training
+
+Factory functions added: `get_360m_pilon_tiered_config()`, `get_360m_pilon_exit_config()`
+
+**Run command:** `bash scripts/run_360m_crossover.sh`
+**Estimated time:** ~6 hours total on RTX 4070
+
+### Phase B.5e: Benchmarking Suite ✅ COMPLETE
+
+**New file:** `pilon_r/benchmark_efficiency.py`
+
+Comprehensive benchmarking:
+- `VRAMEfficiencyCurve`: quality vs VRAM at multiple scales
+- `ComputeEfficiency`: quality vs actual FLOPS (PILON-aware FLOP estimation)
+- `InferenceProfiler`: tok/s, VRAM, avg_layers_per_token, time-to-first-token
+- `QualityBenchmark`: perplexity on held-out data
+- `run_full_benchmark()`: orchestrate all benchmarks across checkpoints
+- CLI: `python -m pilon_r.benchmark_efficiency --checkpoints ... --labels ... --output-dir ...`
+
+Updated `pilon_r/benchmark.py` with early-exit-aware metrics (skip ratios per layer).
+
+---
+
 ## Optimization Ideas Evaluated
 
 ### ✅ Approved for Implementation
@@ -425,11 +499,16 @@ python -m pilon_r.sft outputs/phase_b_sparse_final/final_model.pt \
 - [x] MoE integration (MoECompositionalFFN)
 - [x] **Phase B Sparse Training** (97K steps, ~200k tok/s, convergence gap 1.22×)
 - [x] **SFT Fine-tuning** (1 epoch on OpenHermes-2.5, decent output)
+- [x] Phase B.5a: Compute path fix (forward_sparse, fused MoE)
+- [x] Phase B.5b: TieredPrimitiveBank (hot/warm VRAM tiering)
+- [x] Phase B.5c: Early exit gates (inference FFN skipping)
+- [x] Phase B.5d: 360M crossover experiment setup (configs + script)
+- [x] Phase B.5e: Comprehensive benchmarking suite
 
 ### In Progress
 
-- [ ] Evaluate Phase C readiness (SSM/MLA integration)
-- [ ] Document compression-quality frontier
+- [ ] Run 360M crossover experiment (`bash scripts/run_360m_crossover.sh`)
+- [ ] Analyze crossover results and document findings
 
 ### Planned
 
@@ -486,6 +565,11 @@ python -m pilon_r.sft outputs/phase_b_sparse_final/final_model.pt \
 | Jan 31 | Phase B sparse training complete | 97K steps, 200k tok/s achieved |
 | Jan 31 | SFT validation complete | 1 epoch, decent output quality |
 | Jan 31 | Previous SFT issues identified | Label shift bug (code bug, not model issue) |
+| Feb 23 | Phase B.5a compute path fix complete | forward_sparse avoids compute_all_outputs |
+| Feb 23 | Phase B.5b TieredPrimitiveBank implemented | Hot/warm VRAM tiering with usage-based swaps |
+| Feb 23 | Phase B.5c Early exit gates implemented | Inference FFN skipping + post-hoc gate training |
+| Feb 23 | Phase B.5d 360M crossover experiment ready | 4 configs, 1B tokens each, ~6h on RTX 4070 |
+| Feb 23 | Phase B.5e benchmarking suite complete | VRAM/compute/inference/quality benchmarks |
 
 ---
 
@@ -557,20 +641,30 @@ Demonstrate:
 
 ```
 pilon_r/
-  train.py                     # Training loop
+  train.py                     # Training loop (tiered + early exit CLI)
   evaluate.py                  # Evaluation + generation CLI
   sft.py                       # Supervised fine-tuning
+  benchmark.py                 # Inference benchmarking (early exit aware)
+  benchmark_efficiency.py      # VRAM/compute/inference/quality benchmarks
   compress.py                  # Compression tooling
   compression_curriculum.py    # A.2 orchestration
 
 pilon_r/core/
-  model.py           # PILONTransformer
-  primitives.py      # PrimitiveBank (updating with forward_fast)
-  ffn.py             # CompositionalFFN (adding runtime overrides)
-  config.py          # Configs (adding optimization settings)
+  model.py           # PILONTransformer (early exit + tier swap support)
+  primitives.py      # PrimitiveBank + BandPrimitiveBanks (tiered bank support)
+  tiered_bank.py     # TieredPrimitiveBank (hot/warm VRAM tiering)
+  early_exit.py      # ExitGate + gate training + metrics
+  ffn.py             # CompositionalFFN, MoECompositionalFFN
+  config.py          # Configs (n_hot, early_exit fields)
   baseline.py        # Dense baseline
   metrics.py         # Metrics utilities
   data.py            # Data loading
+
+pilon_r/configs/
+  model_360m.py      # 360M configs (dense, PILON, tiered, exit)
+
+scripts/
+  run_360m_crossover.sh  # 360M 4-config crossover experiment
 ```
 
 ### Key Documents
@@ -597,5 +691,5 @@ python -m pilon_r.sft outputs/phase_b_sparse_final/final_model.pt \
 
 ---
 
-*Last updated: January 31, 2026*
+*Last updated: February 23, 2026*
 

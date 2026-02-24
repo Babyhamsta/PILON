@@ -28,7 +28,7 @@ SHARED_500M_CONFIG = {
     "max_seq_len": 1024,
     "dropout": 0.1,
     "norm_type": "rmsnorm",
-    "checkpoint_ffn": True,  # Gradient checkpointing for VRAM savings
+    "checkpoint_ffn": False,  # Throughput default; can be re-enabled when VRAM-bound
 }
 
 
@@ -60,12 +60,12 @@ PILON_500M_PRIMITIVE_CONFIG = {
     "top_k": 8,
     "share_fc1_fc2": False,
     "composition_type": "static_per_layer",
-    "temperature": 0.5,
+    "temperature": 1.0,
     "activation": "gelu",
     "moe_config": None,
     # Keep VRAM stable by default (forward_fast only when dense)
-    "forward_fast_mode": "auto",
-    "forward_fast_min_topk": None,
+    "forward_fast_mode": "on",
+    "forward_fast_min_topk": 1,
 }
 
 
@@ -121,7 +121,7 @@ def get_500m_pilon_config(
         n_primitives: Number of primitives (default: 96)
         rank: Rank of each primitive (default: 96)
         top_k: Sparsity - top-k primitives used (default: 8)
-        temperature: Softmax temperature (default: 0.5)
+        temperature: Softmax temperature (default: 1.0)
         forward_fast_mode: "auto" | "on" | "off"
         forward_fast_min_topk: Top-k threshold for auto mode
 

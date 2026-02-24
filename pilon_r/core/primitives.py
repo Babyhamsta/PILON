@@ -162,6 +162,28 @@ class PrimitiveBank(nn.Module):
 
         return out_flat.view(batch, seq, self.d_out)
 
+    def select_topk_primitives(
+        self,
+        top_indices: torch.Tensor,
+        active_rank: Optional[int] = None,
+        active_primitives: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather selected primitive factors for reuse across micro-batches.
+        """
+        A = self.A[:, :, :active_rank] if active_rank is not None else self.A
+        B = self.B[:, :active_rank, :] if active_rank is not None else self.B
+        if active_primitives is not None and active_primitives < self.n_primitives:
+            active_primitives = max(1, active_primitives)
+            A = A[:active_primitives]
+            B = B[:active_primitives]
+            top_indices = top_indices[top_indices < active_primitives]
+            if top_indices.numel() == 0:
+                top_indices = torch.arange(
+                    min(1, A.size(0)), device=A.device, dtype=torch.long
+                )
+        return A.index_select(0, top_indices), B.index_select(0, top_indices)
+
     def forward_topk_fused(
         self,
         x: torch.Tensor,
@@ -169,7 +191,8 @@ class PrimitiveBank(nn.Module):
         top_k: int,
         active_rank: Optional[int] = None,
         top_indices: Optional[torch.Tensor] = None,
-        active_primitives: Optional[int] = None
+        active_primitives: Optional[int] = None,
+        preselected: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Sparse fused forward: build a single low-rank map from top-k primitives.
@@ -207,9 +230,18 @@ class PrimitiveBank(nn.Module):
         top_weights = top_weights.float()
         top_weights = top_weights / (top_weights.sum() + 1e-8)
 
-        # Gather top-k primitives
-        A_sel = A.index_select(0, top_indices)  # (k, d_in, r)
-        B_sel = B.index_select(0, top_indices)  # (k, r, d_out)
+        # Gather top-k primitives (or reuse preselected factors when provided).
+        if preselected is not None:
+            if top_indices is None:
+                raise ValueError("preselected factors require top_indices")
+            A_sel, B_sel = preselected
+            top_k = int(A_sel.size(0))
+            if top_weights.numel() != top_k:
+                top_weights = top_weights[:top_k]
+                top_weights = top_weights / (top_weights.sum() + 1e-8)
+        else:
+            A_sel = A.index_select(0, top_indices)  # (k, d_in, r)
+            B_sel = B.index_select(0, top_indices)  # (k, r, d_out)
 
         # Scale each primitive by sqrt(weight) and concatenate into a single low-rank map
         sqrt_w = torch.sqrt(top_weights + 1e-8).to(dtype=A_sel.dtype)
@@ -502,7 +534,9 @@ class BandPrimitiveBanks(nn.Module):
         n_primitives: int,
         rank: int,
         bands: List[Dict],  # [{"name": "early", "layers": [0,1,2]}, ...]
-        share_fc1_fc2: bool = False  # Should be False for Phase A
+        share_fc1_fc2: bool = False,  # Should be False for Phase A
+        n_hot: Optional[int] = None,  # Phase B.5b: tiered primitive loading
+        swap_interval: int = 100,     # Steps between hot/warm swaps
     ):
         super().__init__()
         self.d_model = d_model
@@ -511,12 +545,16 @@ class BandPrimitiveBanks(nn.Module):
         self.rank = rank
         self.bands = bands
         self.share_fc1_fc2 = share_fc1_fc2
+        self.n_hot = n_hot
 
         # Create layer -> band mapping
         self.layer_to_band: Dict[int, str] = {}
         for band in bands:
             for layer_idx in band["layers"]:
                 self.layer_to_band[layer_idx] = band["name"]
+
+        # Determine whether to use tiered banks
+        use_tiered = (n_hot is not None and n_hot < n_primitives)
 
         # Create banks for each band
         # fc1: d_model -> d_ff (expansion)
@@ -527,14 +565,26 @@ class BandPrimitiveBanks(nn.Module):
         for band in bands:
             band_name = band["name"]
 
-            # fc1 bank: projects up
-            self.fc1_banks[band_name] = PrimitiveBank(
-                d_in=d_model,
-                d_out=d_ff,
-                n_primitives=n_primitives,
-                rank=rank,
-                name=f"{band_name}_fc1"
-            )
+            if use_tiered:
+                from .tiered_bank import TieredPrimitiveBank
+                self.fc1_banks[band_name] = TieredPrimitiveBank(
+                    d_in=d_model,
+                    d_out=d_ff,
+                    n_primitives=n_primitives,
+                    rank=rank,
+                    n_hot=n_hot,
+                    swap_interval=swap_interval,
+                    name=f"{band_name}_fc1",
+                )
+            else:
+                # fc1 bank: projects up
+                self.fc1_banks[band_name] = PrimitiveBank(
+                    d_in=d_model,
+                    d_out=d_ff,
+                    n_primitives=n_primitives,
+                    rank=rank,
+                    name=f"{band_name}_fc1"
+                )
 
             if share_fc1_fc2:
                 # Share bank (NOT RECOMMENDED for Phase A)
@@ -544,14 +594,26 @@ class BandPrimitiveBanks(nn.Module):
                     "fc1 and fc2 have different dimensions."
                 )
             else:
-                # fc2 bank: projects down (separate)
-                self.fc2_banks[band_name] = PrimitiveBank(
-                    d_in=d_ff,
-                    d_out=d_model,
-                    n_primitives=n_primitives,
-                    rank=rank,
-                    name=f"{band_name}_fc2"
-                )
+                if use_tiered:
+                    from .tiered_bank import TieredPrimitiveBank
+                    self.fc2_banks[band_name] = TieredPrimitiveBank(
+                        d_in=d_ff,
+                        d_out=d_model,
+                        n_primitives=n_primitives,
+                        rank=rank,
+                        n_hot=n_hot,
+                        swap_interval=swap_interval,
+                        name=f"{band_name}_fc2",
+                    )
+                else:
+                    # fc2 bank: projects down (separate)
+                    self.fc2_banks[band_name] = PrimitiveBank(
+                        d_in=d_ff,
+                        d_out=d_model,
+                        n_primitives=n_primitives,
+                        rank=rank,
+                        name=f"{band_name}_fc2"
+                    )
 
     def get_fc1_bank(self, layer_idx: int) -> PrimitiveBank:
         """Get the fc1 bank for a given layer."""

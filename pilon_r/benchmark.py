@@ -202,6 +202,14 @@ def benchmark_inference(
         results["vram_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
         results["vram_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
 
+    # Early exit metrics (Phase B.5c)
+    exit_metrics = model.get_early_exit_metrics() if hasattr(model, "get_early_exit_metrics") else None
+    if exit_metrics is not None:
+        results["skip_ratios"] = exit_metrics["skip_ratios"]
+        results["avg_layers_per_token"] = exit_metrics["avg_layers_per_token"]
+        results["total_skips"] = exit_metrics["total_skips"]
+        results["total_tokens_exit"] = exit_metrics["total_tokens"]
+
     return results
 
 
@@ -380,6 +388,13 @@ def print_results(results: Dict[str, float], title: str = "Benchmark Results"):
         print(f"  Peak: {results['vram_peak_gb']:.3f} GB")
         print(f"  Allocated: {results.get('vram_allocated_gb', 0):.3f} GB")
         print(f"  Reserved: {results.get('vram_reserved_gb', 0):.3f} GB")
+
+    # Early exit
+    if "skip_ratios" in results:
+        print(f"\nEarly Exit:")
+        print(f"  Avg layers per token: {results['avg_layers_per_token']:.2f}")
+        for layer_name, ratio in results["skip_ratios"].items():
+            print(f"  {layer_name} skip ratio: {ratio:.3f}")
 
 
 def main():

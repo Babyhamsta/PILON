@@ -10,7 +10,7 @@ Contains:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, Tuple
 
 from .primitives import BandPrimitiveBanks, LayerCompositionWeights, ExpertCompositionBank
 
@@ -142,6 +142,9 @@ class CompositionalFFN(nn.Module):
         self.use_fused_topk: bool = True
         self._fc1_topk_cache: Optional[Dict[str, torch.Tensor]] = None
         self._fc2_topk_cache: Optional[Dict[str, torch.Tensor]] = None
+        self.cache_selected_primitives: bool = False
+        self._fc1_selected_cache: Optional[Dict[str, Any]] = None
+        self._fc2_selected_cache: Optional[Dict[str, Any]] = None
 
         # Activation function
         if activation == "gelu":
@@ -208,6 +211,81 @@ class CompositionalFFN(nn.Module):
                 self._fc2_topk_cache["top_k"] = k_fc2
                 self._fc2_topk_cache["active_primitives"] = active_prims
 
+        if not self.cache_selected_primitives:
+            self._fc1_selected_cache = None
+            self._fc2_selected_cache = None
+            return
+
+        # Build selected primitive-factor cache every step (enables reuse across
+        # gradient accumulation micro-batches and checkpoint recomputation).
+        active_prims = self.active_primitives or self.n_primitives
+        active_prims = min(active_prims, self.n_primitives)
+        active_rank = self.active_rank
+        fc1_bank = self.primitive_banks.get_fc1_bank(self.layer_idx)
+        fc2_bank = self.primitive_banks.get_fc2_bank(self.layer_idx)
+
+        k_fc1 = self.runtime_top_k_fc1
+        if k_fc1 is None:
+            k_fc1 = self.runtime_top_k if self.runtime_top_k is not None else self.top_k_fc1
+        if k_fc1 is None:
+            k_fc1 = self.top_k_fc1
+        k_fc1 = int(min(k_fc1, active_prims))
+        if k_fc1 < active_prims and hasattr(fc1_bank, "select_topk_primitives"):
+            fc1_scores = self.composition_weights.get_fc1_logits()
+            fc1_indices = self._get_cached_indices(
+                fc1_scores, k_fc1, self._fc1_topk_cache, active_prims
+            )
+            try:
+                with torch.no_grad():
+                    A_sel, B_sel = fc1_bank.select_topk_primitives(
+                        fc1_indices,
+                        active_rank=active_rank,
+                        active_primitives=active_prims,
+                    )
+                self._fc1_selected_cache = {
+                    "step": self.runtime_step,
+                    "top_k": k_fc1,
+                    "active_primitives": active_prims,
+                    "active_rank": active_rank,
+                    "A_sel": A_sel.detach(),
+                    "B_sel": B_sel.detach(),
+                }
+            except Exception:
+                self._fc1_selected_cache = None
+        else:
+            self._fc1_selected_cache = None
+
+        k_fc2 = self.runtime_top_k_fc2
+        if k_fc2 is None:
+            k_fc2 = self.runtime_top_k if self.runtime_top_k is not None else self.top_k_fc2
+        if k_fc2 is None:
+            k_fc2 = self.top_k_fc2
+        k_fc2 = int(min(k_fc2, active_prims))
+        if k_fc2 < active_prims and hasattr(fc2_bank, "select_topk_primitives"):
+            fc2_scores = self.composition_weights.get_fc2_logits()
+            fc2_indices = self._get_cached_indices(
+                fc2_scores, k_fc2, self._fc2_topk_cache, active_prims
+            )
+            try:
+                with torch.no_grad():
+                    A_sel, B_sel = fc2_bank.select_topk_primitives(
+                        fc2_indices,
+                        active_rank=active_rank,
+                        active_primitives=active_prims,
+                    )
+                self._fc2_selected_cache = {
+                    "step": self.runtime_step,
+                    "top_k": k_fc2,
+                    "active_primitives": active_prims,
+                    "active_rank": active_rank,
+                    "A_sel": A_sel.detach(),
+                    "B_sel": B_sel.detach(),
+                }
+            except Exception:
+                self._fc2_selected_cache = None
+        else:
+            self._fc2_selected_cache = None
+
     def _get_cached_indices(
         self,
         scores: torch.Tensor,
@@ -233,6 +311,29 @@ class CompositionalFFN(nn.Module):
             scores = scores[:active_primitives]
         _, indices = torch.topk(scores, top_k, sorted=False)
         return indices
+
+    def _get_cached_selected(
+        self,
+        cache: Optional[Dict[str, Any]],
+        top_k: int,
+        active_primitives: int,
+        active_rank: Optional[int],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if cache is None:
+            return None
+        if cache.get("step") != self.runtime_step:
+            return None
+        if cache.get("top_k") != top_k:
+            return None
+        if cache.get("active_primitives") != active_primitives:
+            return None
+        if cache.get("active_rank") != active_rank:
+            return None
+        A_sel = cache.get("A_sel")
+        B_sel = cache.get("B_sel")
+        if A_sel is None or B_sel is None:
+            return None
+        return A_sel, B_sel
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -297,6 +398,12 @@ class CompositionalFFN(nn.Module):
             and effective_top_k_fc1 is not None
             and effective_top_k_fc1 < effective_n_primitives
         ):
+            fc1_preselected = self._get_cached_selected(
+                self._fc1_selected_cache,
+                effective_top_k_fc1,
+                effective_n_primitives,
+                active_rank,
+            )
             if force_uniform_fc1:
                 fc1_scores = self.composition_weights.get_fc1_logits()
                 fc1_indices = self._get_cached_indices(
@@ -313,7 +420,8 @@ class CompositionalFFN(nn.Module):
                 top_k=effective_top_k_fc1,
                 active_rank=active_rank,
                 top_indices=fc1_indices,
-                active_primitives=active_primitives
+                active_primitives=active_primitives,
+                preselected=fc1_preselected,
             )
         elif _use_fast_path(effective_top_k_fc1, effective_n_primitives, force_uniform_fc1):
             h = fc1_bank.forward_fast(
@@ -347,6 +455,12 @@ class CompositionalFFN(nn.Module):
             and effective_top_k_fc2 is not None
             and effective_top_k_fc2 < effective_n_primitives
         ):
+            fc2_preselected = self._get_cached_selected(
+                self._fc2_selected_cache,
+                effective_top_k_fc2,
+                effective_n_primitives,
+                active_rank,
+            )
             if force_uniform_fc2:
                 fc2_scores = self.composition_weights.get_fc2_logits()
                 fc2_indices = self._get_cached_indices(
@@ -363,7 +477,8 @@ class CompositionalFFN(nn.Module):
                 top_k=effective_top_k_fc2,
                 active_rank=active_rank,
                 top_indices=fc2_indices,
-                active_primitives=active_primitives
+                active_primitives=active_primitives,
+                preselected=fc2_preselected,
             )
         elif _use_fast_path(effective_top_k_fc2, effective_n_primitives, force_uniform_fc2):
             out = fc2_bank.forward_fast(

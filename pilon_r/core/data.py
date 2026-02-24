@@ -227,6 +227,11 @@ class StreamingTextDataset(IterableDataset):
                     }
 
         for example in dataset:
+            # If remaining token budget cannot fit another full chunk,
+            # stop immediately instead of scanning the stream forever.
+            if worker_max_tokens is not None and (total_tokens + self.max_seq_len) > worker_max_tokens:
+                return
+
             if self.dataset_iterable is not None:
                 if seen < self.skip_examples:
                     seen += 1
@@ -260,6 +265,9 @@ class StreamingTextDataset(IterableDataset):
             pending_texts.clear()
 
         # Flush trailing texts that did not fill a complete tokenization batch.
+        if worker_max_tokens is not None and (total_tokens + self.max_seq_len) > worker_max_tokens:
+            return
+
         for chunked in flush_pending(pending_texts):
             yield chunked
             if worker_max_tokens is not None and total_tokens >= worker_max_tokens:
@@ -271,7 +279,8 @@ def load_tinystories(
     max_seq_len: int = 512,
     max_tokens: Optional[int] = None,
     split: str = "train",
-    streaming: bool = True
+    streaming: bool = True,
+    tokenize_batch_size: int = 32,
 ) -> Dataset:
     """
     Load TinyStories dataset.
@@ -292,7 +301,8 @@ def load_tinystories(
             tokenizer=tokenizer,
             max_seq_len=max_seq_len,
             split=split,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
+            tokenize_batch_size=tokenize_batch_size,
         )
     else:
         from datasets import load_dataset
@@ -319,7 +329,8 @@ def load_openwebtext(
     max_seq_len: int = 512,
     max_tokens: Optional[int] = None,
     split: str = "train",
-    streaming: bool = True
+    streaming: bool = True,
+    tokenize_batch_size: int = 32,
 ) -> Dataset:
     """
     Load OpenWebText-10k dataset (GPT-2 style web text).
@@ -360,7 +371,8 @@ def load_openwebtext(
             split=target_split,
             max_tokens=max_tokens,
             skip_examples=skip_examples,
-            max_examples=max_examples
+            max_examples=max_examples,
+            tokenize_batch_size=tokenize_batch_size,
         )
     else:
         from datasets import load_dataset
@@ -401,7 +413,8 @@ def load_text_dataset(
     max_seq_len: int = 512,
     max_tokens: Optional[int] = None,
     split: str = "train",
-    streaming: bool = True
+    streaming: bool = True,
+    tokenize_batch_size: int = 32,
 ) -> Dataset:
     """
     Generic loader for text datasets.
@@ -438,7 +451,8 @@ def load_text_dataset(
                     max_seq_len=max_seq_len,
                     split=split,
                     max_tokens=max_tokens,
-                    dataset_iterable=dataset
+                    dataset_iterable=dataset,
+                    tokenize_batch_size=tokenize_batch_size,
                 )
             texts = []
             for ex in dataset:
@@ -455,11 +469,32 @@ def load_text_dataset(
 
     # Use specialized loaders for known datasets
     if "tinystories" in dataset_name.lower():
-        return load_tinystories(tokenizer, max_seq_len, max_tokens, split, streaming)
+        return load_tinystories(
+            tokenizer,
+            max_seq_len,
+            max_tokens,
+            split,
+            streaming,
+            tokenize_batch_size=tokenize_batch_size,
+        )
     elif "openwebtext" in dataset_name.lower():
-        return load_openwebtext(tokenizer, max_seq_len, max_tokens, split, streaming)
+        return load_openwebtext(
+            tokenizer,
+            max_seq_len,
+            max_tokens,
+            split,
+            streaming,
+            tokenize_batch_size=tokenize_batch_size,
+        )
     elif "fineweb-edu" in dataset_name.lower():
-        return load_fineweb_edu(tokenizer, max_seq_len, max_tokens, split, streaming)
+        return load_fineweb_edu(
+            tokenizer,
+            max_seq_len,
+            max_tokens,
+            split,
+            streaming,
+            tokenize_batch_size=tokenize_batch_size,
+        )
 
     # Generic loader for other datasets
     if streaming:
@@ -468,7 +503,8 @@ def load_text_dataset(
             tokenizer=tokenizer,
             max_seq_len=max_seq_len,
             split=split,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
+            tokenize_batch_size=tokenize_batch_size,
         )
     else:
         from datasets import load_dataset
@@ -497,7 +533,8 @@ def load_fineweb_edu(
     max_tokens: Optional[int] = None,
     split: str = "train",
     streaming: bool = True,
-    dataset_subset: str = "sample-10BT"
+    dataset_subset: str = "sample-10BT",
+    tokenize_batch_size: int = 32,
 ) -> Dataset:
     """
     Load FineWeb-Edu dataset.
@@ -534,7 +571,8 @@ def load_fineweb_edu(
             max_tokens=max_tokens,
             skip_examples=skip_examples,
             max_examples=max_examples,
-            dataset_config=dataset_subset
+            dataset_config=dataset_subset,
+            tokenize_batch_size=tokenize_batch_size,
         )
     else:
         from datasets import load_dataset

@@ -15,6 +15,7 @@ from torch.utils.checkpoint import checkpoint
 from .config import ModelConfig, PrimitiveConfig, MoEConfig
 from .primitives import BandPrimitiveBanks, LayerCompositionWeights
 from .ffn import create_ffn, CompositionalFFN, MoECompositionalFFN
+from .early_exit import ExitGate
 
 
 class RMSNorm(nn.Module):
@@ -233,12 +234,20 @@ class TransformerBlock(nn.Module):
         forward_fast_mode: str = "auto",
         forward_fast_min_topk: Optional[int] = None,
         # MoE params (Phase B)
-        moe_config: Optional[MoEConfig] = None
+        moe_config: Optional[MoEConfig] = None,
+        # Early exit params (Phase B.5c)
+        enable_early_exit: bool = False,
+        exit_threshold: float = 0.5,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self._last_aux_loss = 0.0  # Store aux_loss from last forward pass
         self.checkpoint_ffn = checkpoint_ffn
+        self.enable_early_exit = enable_early_exit
+        self.exit_threshold = exit_threshold
+        self._last_skip_count = 0
+        self._last_total_count = 0
+        self._last_exit_confidence: Optional[torch.Tensor] = None
 
         # Normalization
         if norm_type == "rmsnorm":
@@ -278,6 +287,8 @@ class TransformerBlock(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # Early exit gate (Phase B.5c)
+        self.exit_gate = ExitGate(d_model) if enable_early_exit else None
 
     def forward(
         self,
@@ -306,31 +317,85 @@ class TransformerBlock(nn.Module):
             present_kv = None
         x = x + self.dropout(h)
 
+        # Early-exit confidence (always computed if gate exists so gates can be trained jointly).
+        skip_all = False
+        skip_mask = None
+        if self.enable_early_exit and self.exit_gate is not None:
+            confidence = self.exit_gate(x)  # (B, S, 1)
+            self._last_exit_confidence = confidence
+            if not self.training:
+                skip_mask = (confidence > self.exit_threshold)  # (B, S, 1)
+                n_total = skip_mask.numel()
+                n_skip = skip_mask.sum().item()
+                self._last_skip_count = int(n_skip)
+                self._last_total_count = int(n_total)
+                if skip_mask.all():
+                    skip_all = True
+            else:
+                self._last_skip_count = 0
+                self._last_total_count = 0
+        else:
+            self._last_skip_count = 0
+            self._last_total_count = 0
+            self._last_exit_confidence = None
+
+        if skip_all:
+            # All tokens skip FFN
+            if use_cache:
+                return x, present_kv
+            return x
+
         # FFN with residual
         h = self.norm2(x)
-        if self.checkpoint_ffn and self.training:
-            def ffn_forward(t: torch.Tensor):
-                out = self.ffn(t)
-                if isinstance(out, dict):
-                    aux = out.get("aux_loss", t.new_zeros(()))
-                    if not torch.is_tensor(aux):
-                        aux = t.new_tensor(aux)
-                    return out["output"], aux
-                return out, t.new_zeros(())
 
-            ffn_out, aux_loss = checkpoint(ffn_forward, h, use_reentrant=False)
-            h = ffn_out
-            self._last_aux_loss = aux_loss
-        else:
-            ffn_result = self.ffn(h)
+        if skip_mask is not None and skip_mask.any() and not skip_mask.all():
+            # Mixed skip: only run FFN on non-skip tokens
+            B, S, D = x.shape
+            flat_mask = (~skip_mask.squeeze(-1)).reshape(-1)  # (B*S,) True = compute
+            compute_indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)
 
-            # Handle MoE dict return or standard tensor return
+            h_flat = h.reshape(-1, D)
+            h_compute = h_flat.index_select(0, compute_indices)  # (N_compute, D)
+            h_compute = h_compute.unsqueeze(0)  # (1, N_compute, D) for FFN
+
+            ffn_result = self.ffn(h_compute)
             if isinstance(ffn_result, dict):
-                h = ffn_result["output"]
+                ffn_out = ffn_result["output"]
                 self._last_aux_loss = ffn_result.get("aux_loss", 0.0)
             else:
-                h = ffn_result
+                ffn_out = ffn_result
                 self._last_aux_loss = 0.0
+
+            ffn_out = ffn_out.squeeze(0)  # (N_compute, D)
+
+            # Scatter back
+            full_ffn = torch.zeros_like(h_flat)
+            full_ffn.index_copy_(0, compute_indices, ffn_out)
+            h = full_ffn.view(B, S, D)
+        else:
+            if self.checkpoint_ffn and self.training:
+                def ffn_forward(t: torch.Tensor):
+                    out = self.ffn(t)
+                    if isinstance(out, dict):
+                        aux = out.get("aux_loss", t.new_zeros(()))
+                        if not torch.is_tensor(aux):
+                            aux = t.new_tensor(aux)
+                        return out["output"], aux
+                    return out, t.new_zeros(())
+
+                ffn_out, aux_loss = checkpoint(ffn_forward, h, use_reentrant=False)
+                h = ffn_out
+                self._last_aux_loss = aux_loss
+            else:
+                ffn_result = self.ffn(h)
+
+                # Handle MoE dict return or standard tensor return
+                if isinstance(ffn_result, dict):
+                    h = ffn_result["output"]
+                    self._last_aux_loss = ffn_result.get("aux_loss", 0.0)
+                else:
+                    h = ffn_result
+                    self._last_aux_loss = 0.0
 
         x = x + self.dropout(h)
 
@@ -341,6 +406,10 @@ class TransformerBlock(nn.Module):
     def get_aux_loss(self) -> float:
         """Get auxiliary loss from last forward pass (MoE only)."""
         return self._last_aux_loss
+
+    def get_exit_confidence(self) -> Optional[torch.Tensor]:
+        """Get latest exit-gate confidence tensor for this block."""
+        return self._last_exit_confidence
 
     def get_ffn_entropy(self) -> Optional[Dict[str, float]]:
         """Get FFN entropy if compositional."""
@@ -393,7 +462,9 @@ class PILONTransformer(nn.Module):
                 n_primitives=pc.n_primitives,
                 rank=pc.rank,
                 bands=bands,
-                share_fc1_fc2=pc.share_fc1_fc2
+                share_fc1_fc2=pc.share_fc1_fc2,
+                n_hot=pc.n_hot,
+                swap_interval=pc.swap_interval,
             )
 
         # Get MoE config if present
@@ -423,7 +494,9 @@ class PILONTransformer(nn.Module):
                 temperature=config.primitive_config.temperature if config.ffn_type == "compositional" else 1.0,
                 forward_fast_mode=config.primitive_config.forward_fast_mode if config.ffn_type == "compositional" else "auto",
                 forward_fast_min_topk=config.primitive_config.forward_fast_min_topk if config.ffn_type == "compositional" else None,
-                moe_config=moe_config
+                moe_config=moe_config,
+                enable_early_exit=config.enable_early_exit,
+                exit_threshold=config.exit_threshold,
             )
             for i in range(config.n_layers)
         ])
@@ -491,6 +564,7 @@ class PILONTransformer(nn.Module):
 
         # Apply transformer blocks and collect aux_losses
         total_aux_loss = 0.0
+        exit_confidences: List[torch.Tensor] = []
         present_key_values = [] if use_cache else None
         for i, layer in enumerate(self.layers):
             past_kv = None
@@ -502,6 +576,10 @@ class PILONTransformer(nn.Module):
             else:
                 x = layer(x, attn_mask)
             total_aux_loss = total_aux_loss + layer.get_aux_loss()
+            if self.training:
+                layer_exit_conf = layer.get_exit_confidence()
+                if layer_exit_conf is not None:
+                    exit_confidences.append(layer_exit_conf)
 
         # Final norm
         x = self.final_norm(x)
@@ -512,9 +590,14 @@ class PILONTransformer(nn.Module):
         output = {"logits": logits}
         if use_cache:
             output["past_key_values"] = present_key_values
+        if self.training and exit_confidences:
+            output["exit_confidences"] = torch.stack(exit_confidences, dim=0)
 
-        # Include aux_loss if non-zero (MoE)
-        if total_aux_loss != 0.0:
+        # Include aux_loss for MoE (even when currently zero) so train loop can
+        # consistently apply configured aux weighting.
+        if isinstance(total_aux_loss, torch.Tensor):
+            output["aux_loss"] = total_aux_loss
+        elif total_aux_loss != 0.0:
             output["aux_loss"] = total_aux_loss
 
         # Compute loss if labels provided
@@ -711,6 +794,55 @@ class PILONTransformer(nn.Module):
         metrics["mean_expert_similarity"] = sum(expert_sims) / len(expert_sims)
 
         return metrics
+
+    def swap_tiers(self, optimizer) -> int:
+        """
+        Iterate all primitive banks and call maybe_swap() on tiered banks.
+
+        Args:
+            optimizer: The optimizer to transfer Adam states
+
+        Returns:
+            Number of banks that performed a swap
+        """
+        n_swapped = 0
+        if self.primitive_banks is not None:
+            from .tiered_bank import TieredPrimitiveBank
+            for bank in list(self.primitive_banks.fc1_banks.values()) + list(self.primitive_banks.fc2_banks.values()):
+                if isinstance(bank, TieredPrimitiveBank):
+                    if bank.maybe_swap(optimizer):
+                        n_swapped += 1
+        return n_swapped
+
+    def get_early_exit_metrics(self) -> Optional[Dict[str, Any]]:
+        """Get skip counts per layer for early exit."""
+        has_exit = False
+        skip_ratios = {}
+        total_skips = 0
+        total_tokens = 0
+        for i, layer in enumerate(self.layers):
+            if layer.enable_early_exit and layer.exit_gate is not None:
+                has_exit = True
+                skip = layer._last_skip_count
+                total = layer._last_total_count
+                ratio = skip / max(total, 1)
+                skip_ratios[f"layer_{i}"] = ratio
+                total_skips += skip
+                total_tokens += total
+
+        if not has_exit:
+            return None
+
+        n_layers = len(self.layers)
+        avg_skip_ratio = total_skips / max(total_tokens, 1)
+        avg_layers = n_layers * (1.0 - avg_skip_ratio)
+
+        return {
+            "skip_ratios": skip_ratios,
+            "avg_layers_per_token": avg_layers,
+            "total_skips": total_skips,
+            "total_tokens": total_tokens,
+        }
 
     def is_moe_model(self) -> bool:
         """Check if this model uses MoE."""

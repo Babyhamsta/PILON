@@ -29,7 +29,7 @@ SHARED_360M_CONFIG = {
     "max_seq_len": 2048,
     "dropout": 0.1,
     "norm_type": "rmsnorm",
-    "checkpoint_ffn": True,  # Gradient checkpointing for VRAM savings
+    "checkpoint_ffn": False,  # Throughput default; can be re-enabled when VRAM-bound
 }
 
 
@@ -60,9 +60,11 @@ PILON_360M_PRIMITIVE_CONFIG = {
     "top_k": 8,
     "share_fc1_fc2": False,  # Separate banks for fc1 and fc2
     "composition_type": "static_per_layer",
-    "temperature": 0.5,
+    "temperature": 1.0,
     "activation": "gelu",
     "moe_config": None,  # Static composition, not MoE
+    "forward_fast_mode": "on",
+    "forward_fast_min_topk": 1,
 }
 
 
@@ -114,10 +116,10 @@ def get_360m_pilon_config(
     Get PILON-360M configuration with optional overrides.
 
     Args:
-        n_primitives: Number of primitives (default: 64)
-        rank: Rank of each primitive (default: 64)
+        n_primitives: Number of primitives (default: 80)
+        rank: Rank of each primitive (default: 80)
         top_k: Sparsity - top-k primitives used (default: 8)
-        temperature: Softmax temperature (default: 0.5)
+        temperature: Softmax temperature (default: 1.0)
 
     Returns:
         ModelConfig for PILON-360M
@@ -131,6 +133,8 @@ def get_360m_pilon_config(
         temperature=temperature or PILON_360M_PRIMITIVE_CONFIG["temperature"],
         activation=PILON_360M_PRIMITIVE_CONFIG["activation"],
         moe_config=None,
+        forward_fast_mode=PILON_360M_PRIMITIVE_CONFIG["forward_fast_mode"],
+        forward_fast_min_topk=PILON_360M_PRIMITIVE_CONFIG["forward_fast_min_topk"],
         bands=_create_360m_bands()
     )
 
@@ -151,6 +155,86 @@ def get_360m_dense_config() -> ModelConfig:
     return ModelConfig(
         **SHARED_360M_CONFIG,
         ffn_type="standard",
+    )
+
+
+def get_360m_pilon_tiered_config(
+    n_hot: int = 16,
+    swap_interval: int = 100,
+) -> ModelConfig:
+    """
+    Get PILON-360M configuration with tiered primitive bank (Phase B.5b).
+
+    Only n_hot primitives live in VRAM; the rest are in CPU pinned memory.
+
+    Args:
+        n_hot: Number of hot primitives in VRAM
+        swap_interval: Steps between hot/warm swaps
+
+    Returns:
+        ModelConfig for PILON-360M with tiered banks
+    """
+    primitive_config = PrimitiveConfig(
+        n_primitives=PILON_360M_PRIMITIVE_CONFIG["n_primitives"],
+        rank=PILON_360M_PRIMITIVE_CONFIG["rank"],
+        top_k=PILON_360M_PRIMITIVE_CONFIG["top_k"],
+        share_fc1_fc2=PILON_360M_PRIMITIVE_CONFIG["share_fc1_fc2"],
+        composition_type=PILON_360M_PRIMITIVE_CONFIG["composition_type"],
+        temperature=PILON_360M_PRIMITIVE_CONFIG["temperature"],
+        activation=PILON_360M_PRIMITIVE_CONFIG["activation"],
+        moe_config=None,
+        forward_fast_mode=PILON_360M_PRIMITIVE_CONFIG["forward_fast_mode"],
+        forward_fast_min_topk=PILON_360M_PRIMITIVE_CONFIG["forward_fast_min_topk"],
+        bands=_create_360m_bands(),
+        n_hot=n_hot,
+        swap_interval=swap_interval,
+    )
+
+    return ModelConfig(
+        **SHARED_360M_CONFIG,
+        ffn_type="compositional",
+        primitive_config=primitive_config,
+    )
+
+
+def get_360m_pilon_exit_config(
+    n_hot: int = 16,
+    exit_threshold: float = 0.5,
+    swap_interval: int = 100,
+) -> ModelConfig:
+    """
+    Get PILON-360M configuration with tiered bank + early exit (Phase B.5b + B.5c).
+
+    Args:
+        n_hot: Number of hot primitives in VRAM
+        exit_threshold: Skip confidence threshold for early exit
+        swap_interval: Steps between hot/warm swaps
+
+    Returns:
+        ModelConfig for PILON-360M with tiered banks and early exit
+    """
+    primitive_config = PrimitiveConfig(
+        n_primitives=PILON_360M_PRIMITIVE_CONFIG["n_primitives"],
+        rank=PILON_360M_PRIMITIVE_CONFIG["rank"],
+        top_k=PILON_360M_PRIMITIVE_CONFIG["top_k"],
+        share_fc1_fc2=PILON_360M_PRIMITIVE_CONFIG["share_fc1_fc2"],
+        composition_type=PILON_360M_PRIMITIVE_CONFIG["composition_type"],
+        temperature=PILON_360M_PRIMITIVE_CONFIG["temperature"],
+        activation=PILON_360M_PRIMITIVE_CONFIG["activation"],
+        moe_config=None,
+        forward_fast_mode=PILON_360M_PRIMITIVE_CONFIG["forward_fast_mode"],
+        forward_fast_min_topk=PILON_360M_PRIMITIVE_CONFIG["forward_fast_min_topk"],
+        bands=_create_360m_bands(),
+        n_hot=n_hot,
+        swap_interval=swap_interval,
+    )
+
+    return ModelConfig(
+        **SHARED_360M_CONFIG,
+        ffn_type="compositional",
+        primitive_config=primitive_config,
+        enable_early_exit=True,
+        exit_threshold=exit_threshold,
     )
 
 

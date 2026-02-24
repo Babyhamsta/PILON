@@ -17,7 +17,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,14 +27,16 @@ from torch.amp import GradScaler, autocast
 
 from .core.config import (
     ModelConfig,
+    MoEConfig,
     TrainingConfig,
     get_compression_config,
     get_all_compression_levels,
 )
 from .core.model import PILONTransformer, create_model, create_baseline_model
-from .core.ffn import CompositionalFFN
+from .core.ffn import CompositionalFFN, MoECompositionalFFN
 from .core.data import load_text_dataset, get_tokenizer, create_dataloader
 from .core.metrics import Logger, TrainingMetrics
+from .core.early_exit import train_exit_gates
 from .configs.model_360m import get_360m_config, get_360m_training_config
 from .configs.model_500m import get_500m_config, get_500m_training_config
 
@@ -379,7 +381,124 @@ def compute_composition_entropy_loss(model: PILONTransformer) -> Optional[torch.
     return torch.stack(entropies).mean()
 
 
-def build_optimizer(model: PILONTransformer, base_lr: float) -> AdamW:
+def compute_band_diversity_loss(model: PILONTransformer) -> Optional[torch.Tensor]:
+    """
+    Encourage layers in the same band to use different primitive mixes.
+
+    Returns mean cosine similarity across layer pairs (lower is better).
+    """
+    if getattr(model, "primitive_banks", None) is None:
+        return None
+    band_to_layers: Dict[str, List[int]] = {}
+    for band in model.config.primitive_config.bands:
+        band_to_layers[band.name] = list(band.layers)
+
+    pair_sims: List[torch.Tensor] = []
+    for layer_indices in band_to_layers.values():
+        if len(layer_indices) < 2:
+            continue
+        fc1_weights = []
+        fc2_weights = []
+        for idx in layer_indices:
+            if idx < 0 or idx >= len(model.layers):
+                continue
+            ffn = model.layers[idx].ffn
+            if isinstance(ffn, CompositionalFFN):
+                fc1_weights.append(ffn.composition_weights.get_fc1_weights())
+                fc2_weights.append(ffn.composition_weights.get_fc2_weights())
+            elif isinstance(ffn, MoECompositionalFFN):
+                fc1_expert_weights, fc2_expert_weights = ffn.expert_compositions.get_all_expert_weights()
+                fc1_weights.append(fc1_expert_weights.mean(dim=0))
+                fc2_weights.append(fc2_expert_weights.mean(dim=0))
+        if len(fc1_weights) < 2:
+            continue
+
+        def _pairwise_cos(ws: List[torch.Tensor]) -> List[torch.Tensor]:
+            sims: List[torch.Tensor] = []
+            normed = [F.normalize(w, p=2, dim=0) for w in ws]
+            for i in range(len(normed)):
+                for j in range(i + 1, len(normed)):
+                    sims.append((normed[i] * normed[j]).sum())
+            return sims
+
+        pair_sims.extend(_pairwise_cos(fc1_weights))
+        pair_sims.extend(_pairwise_cos(fc2_weights))
+
+    if not pair_sims:
+        return None
+    return torch.stack(pair_sims).mean()
+
+
+def compute_hot_tier_bias_loss(model: PILONTransformer) -> Optional[torch.Tensor]:
+    """
+    Encourage composition mass to sit on hot primitives in tiered banks.
+    """
+    losses: List[torch.Tensor] = []
+    if getattr(model, "primitive_banks", None) is None:
+        return None
+
+    for layer_idx, layer in enumerate(model.layers):
+        ffn = layer.ffn
+        if not isinstance(ffn, (CompositionalFFN, MoECompositionalFFN)):
+            continue
+        fc1_bank = model.primitive_banks.get_fc1_bank(layer_idx)
+        fc2_bank = model.primitive_banks.get_fc2_bank(layer_idx)
+        if not (hasattr(fc1_bank, "hot_indices") and hasattr(fc2_bank, "hot_indices")):
+            continue
+        fc1_hot = fc1_bank.hot_indices
+        fc2_hot = fc2_bank.hot_indices
+        if fc1_hot is None or fc2_hot is None:
+            continue
+        if isinstance(ffn, CompositionalFFN):
+            fc1_w = ffn.composition_weights.get_fc1_weights()
+            fc2_w = ffn.composition_weights.get_fc2_weights()
+        else:
+            fc1_expert_weights, fc2_expert_weights = ffn.expert_compositions.get_all_expert_weights()
+            fc1_w = fc1_expert_weights.mean(dim=0)
+            fc2_w = fc2_expert_weights.mean(dim=0)
+        hot_mass_fc1 = fc1_w.index_select(0, fc1_hot).sum()
+        hot_mass_fc2 = fc2_w.index_select(0, fc2_hot).sum()
+        losses.append(1.0 - hot_mass_fc1)
+        losses.append(1.0 - hot_mass_fc2)
+
+    if not losses:
+        return None
+    return torch.stack(losses).mean()
+
+
+def compute_joint_exit_loss(
+    exit_confidences: torch.Tensor,
+    logits: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Self-supervised gate target from token certainty.
+
+    exit_confidences: (L, B, S, 1)
+    logits: (B, S, V)
+    """
+    # Confidence target from normalized entropy: low entropy => easier token => higher skip confidence.
+    probs = F.softmax(logits.detach(), dim=-1)
+    entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1, keepdim=True)
+    norm = math.log(max(2, logits.size(-1)))
+    certainty = torch.clamp(1.0 - (entropy / max(norm, 1e-8)), 0.0, 1.0)
+
+    n_layers = exit_confidences.size(0)
+    layer_scale = torch.linspace(
+        0.5,
+        1.0,
+        steps=n_layers,
+        device=exit_confidences.device,
+        dtype=exit_confidences.dtype,
+    ).view(n_layers, 1, 1, 1)
+    target = (certainty.unsqueeze(0) * layer_scale).clamp(0.0, 1.0)
+    return F.binary_cross_entropy(exit_confidences, target)
+
+
+def build_optimizer(
+    model: PILONTransformer,
+    base_lr: float,
+    primitive_weight_decay: float = 0.0,
+) -> AdamW:
     primitive_params = []
     composition_params = []
     base_params = []
@@ -394,7 +513,12 @@ def build_optimizer(model: PILONTransformer, base_lr: float) -> AdamW:
 
     param_groups = []
     if primitive_params:
-        param_groups.append({"params": primitive_params, "lr": base_lr, "weight_decay": 0.1, "name": "primitives"})
+        param_groups.append({
+            "params": primitive_params,
+            "lr": base_lr,
+            "weight_decay": primitive_weight_decay,
+            "name": "primitives",
+        })
     if composition_params:
         param_groups.append({"params": composition_params, "lr": base_lr, "weight_decay": 0.0, "name": "composition"})
     if base_params:
@@ -486,6 +610,9 @@ def train_v2(args: argparse.Namespace) -> None:
     if args.baseline:
         model_config.ffn_type = "standard"
 
+    if args.checkpoint_ffn is not None:
+        model_config.checkpoint_ffn = args.checkpoint_ffn
+
     if model_config.ffn_type == "compositional":
         if args.compression_level is not None:
             compression = get_compression_config(args.compression_level)
@@ -511,6 +638,25 @@ def train_v2(args: argparse.Namespace) -> None:
             model_config.primitive_config.top_k_fc2 = args.top_k_fc2
         if args.composition_temp is not None:
             model_config.primitive_config.temperature = args.composition_temp
+        if args.forward_fast_mode is not None:
+            model_config.primitive_config.forward_fast_mode = args.forward_fast_mode
+        if args.forward_fast_min_topk is not None:
+            model_config.primitive_config.forward_fast_min_topk = args.forward_fast_min_topk
+
+        if args.moe_experts is not None:
+            n_experts = max(1, int(args.moe_experts))
+            top_k_experts = args.moe_top_k
+            if top_k_experts is None:
+                top_k_experts = min(2, n_experts)
+            top_k_experts = int(max(1, min(n_experts, int(top_k_experts))))
+            model_config.primitive_config.moe_config = MoEConfig(
+                n_experts=n_experts,
+                top_k=top_k_experts,
+                router_type=args.moe_router_type,
+                router_hidden_dim=args.moe_router_hidden_dim,
+                aux_loss_weight=max(0.0, float(args.moe_aux_loss_weight)),
+                load_balancing=not args.no_moe_load_balancing,
+            )
 
         pc = model_config.primitive_config
         pc.n_primitives = max(1, int(pc.n_primitives))
@@ -524,6 +670,21 @@ def train_v2(args: argparse.Namespace) -> None:
             pc.top_k_fc2 = pc.top_k
         else:
             pc.top_k_fc2 = int(max(1, min(pc.n_primitives, int(pc.top_k_fc2))))
+        if pc.forward_fast_min_topk is not None:
+            pc.forward_fast_min_topk = int(max(1, min(pc.n_primitives, int(pc.forward_fast_min_topk))))
+
+    # Phase B.5b: Tiered primitive bank
+    if model_config.ffn_type == "compositional":
+        if args.n_hot is not None:
+            model_config.primitive_config.n_hot = args.n_hot
+        if args.swap_interval is not None:
+            model_config.primitive_config.swap_interval = args.swap_interval
+
+    # Phase B.5c: Early exit
+    if args.enable_early_exit:
+        model_config.enable_early_exit = True
+    if args.exit_threshold is not None:
+        model_config.exit_threshold = args.exit_threshold
 
     # Override sequence length if specified
     if args.seq_len is not None:
@@ -549,6 +710,16 @@ def train_v2(args: argparse.Namespace) -> None:
         train_config = TrainingConfig()
         if args.seq_len is not None:
             train_config.max_seq_len = args.seq_len
+        # Handle --total-tokens for 48M (not handled by a dedicated config function)
+        if args.total_tokens is not None:
+            bs = args.batch_size or train_config.micro_batch_size
+            ga = args.grad_accum or train_config.gradient_accumulation
+            sl = args.seq_len or train_config.max_seq_len
+            tokens_per_step = bs * ga * sl
+            train_config.total_steps = max(1, args.total_tokens // tokens_per_step)
+            train_config.tokens = args.total_tokens
+            train_config.warmup_steps = min(500, train_config.total_steps // 10)
+            train_config.save_every = max(1000, train_config.total_steps // 5)
 
     if args.steps is not None:
         train_config.total_steps = args.steps
@@ -560,6 +731,14 @@ def train_v2(args: argparse.Namespace) -> None:
         train_config.dataset = args.dataset
     if args.save_every is not None:
         train_config.save_every = args.save_every
+    if args.num_workers is not None:
+        train_config.num_workers = max(0, int(args.num_workers))
+    if args.prefetch_factor is not None:
+        train_config.prefetch_factor = max(1, int(args.prefetch_factor))
+    if args.persistent_workers is not None:
+        train_config.persistent_workers = bool(args.persistent_workers)
+    if train_config.num_workers <= 0:
+        train_config.persistent_workers = False
 
     # Store start time for wall-clock tracking
     training_start_time = time.time()
@@ -576,6 +755,63 @@ def train_v2(args: argparse.Namespace) -> None:
         logger.warning("CUDA not available, falling back to CPU")
         device = "cpu"
     model.to(device)
+
+    # Phase B.5c: Post-hoc gate training mode
+    if getattr(args, "train_exit_gates", False):
+        if not model_config.enable_early_exit:
+            raise ValueError("--train-exit-gates requires --enable-early-exit")
+        if args.resume is None:
+            raise ValueError("--train-exit-gates requires --resume to load a trained checkpoint")
+
+        # Load checkpoint
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        logger.info(f"Loaded checkpoint from {args.resume} for gate training")
+
+        # Create dataloader — pre-load into memory for fast multi-epoch iteration.
+        # Gate training only needs 5M tokens; streaming re-init per epoch is too slow
+        # for large datasets like fineweb-edu (skip + re-download each epoch).
+        tokenizer = get_tokenizer(getattr(args, "tokenizer_path", None))
+        logger.info("Loading gate training data (5M tokens)...")
+        gate_dataset_stream = load_text_dataset(
+            dataset_name=args.dataset or "Elriggs/openwebtext-100k",
+            tokenizer=tokenizer,
+            max_seq_len=model_config.max_seq_len,
+            max_tokens=5_000_000,
+            split="train",
+            streaming=True,
+            tokenize_batch_size=args.tokenize_batch_size,
+        )
+        # Materialize streaming dataset into memory for multi-epoch reuse
+        gate_data_list = []
+        for item in gate_dataset_stream:
+            gate_data_list.append(item)
+        logger.info(f"Gate data loaded: {len(gate_data_list)} sequences")
+        from torch.utils.data import TensorDataset
+        gate_ids = torch.stack([item["input_ids"] for item in gate_data_list])
+        gate_masks = torch.stack([item.get("attention_mask", torch.ones_like(item["input_ids"])) for item in gate_data_list])
+        gate_dataset = TensorDataset(gate_ids, gate_masks)
+        gate_loader = create_dataloader(
+            gate_dataset, batch_size=args.batch_size or 4, shuffle=True,
+        )
+
+        logger.info("Starting exit gate training...")
+        history = train_exit_gates(
+            model, gate_loader, torch.device(device),
+            epochs=3, lr=1e-3, exit_threshold=model_config.exit_threshold,
+        )
+        logger.info(f"Gate training complete. Losses: {history['epoch_losses']}")
+
+        # Save model with trained gates
+        gate_path = output_dir / "model_with_gates.pt"
+        gate_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "config": model_config,
+        }, gate_path)
+        logger.info(f"Saved gate-trained model to {gate_path}")
+        return
 
     if device.startswith("cuda") and args.tf32:
         if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
@@ -611,7 +847,8 @@ def train_v2(args: argparse.Namespace) -> None:
         max_seq_len=train_config.max_seq_len,
         max_tokens=train_config.tokens,
         split="train",
-        streaming=True
+        streaming=True,
+        tokenize_batch_size=args.tokenize_batch_size,
     )
     val_dataset = load_text_dataset(
         dataset_name=train_config.dataset,
@@ -619,7 +856,8 @@ def train_v2(args: argparse.Namespace) -> None:
         max_seq_len=train_config.max_seq_len,
         max_tokens=2_000_000,
         split="validation",
-        streaming=True
+        streaming=True,
+        tokenize_batch_size=args.tokenize_batch_size,
     )
 
     train_loader = create_dataloader(
@@ -648,7 +886,11 @@ def train_v2(args: argparse.Namespace) -> None:
 
     # Optimizer (created AFTER compile to ensure we capture the right parameters)
     base_lr = compute_base_lr(0, train_config)
-    optimizer = build_optimizer(model, base_lr)
+    optimizer = build_optimizer(
+        model,
+        base_lr,
+        primitive_weight_decay=max(0.0, float(args.primitive_weight_decay)),
+    )
 
     # AMP
     amp_dtype = resolve_autocast_dtype(train_config.precision, device)
@@ -673,8 +915,10 @@ def train_v2(args: argparse.Namespace) -> None:
             router_n_experts = n_primitives
             router_top_k_final = top_k_final
         rank_final = model_config.primitive_config.rank
-        rank_start = args.rank_start or max(8, rank_final // 4)
-        rank_mid = args.rank_mid or max(rank_start, int(round(rank_final * 0.75)))
+        rank_start = args.rank_start if args.rank_start is not None else rank_final
+        rank_mid = args.rank_mid if args.rank_mid is not None else rank_final
+        rank_start = int(max(1, min(rank_final, rank_start)))
+        rank_mid = int(max(rank_start, min(rank_final, rank_mid)))
     else:
         n_primitives = 1
         top_k_final = 1
@@ -729,15 +973,58 @@ def train_v2(args: argparse.Namespace) -> None:
     topk_cache_steps = args.topk_cache_steps
     if topk_cache_steps is not None and topk_cache_steps <= 0:
         topk_cache_steps = None
+    if is_compositional and topk_cache_steps is None:
+        topk_cache_steps = 10
     freeze_primitives_phase2 = train_config.freeze_primitives_in_phase2
     if args.freeze_primitives_phase2 is not None:
         freeze_primitives_phase2 = args.freeze_primitives_phase2
     comp_entropy_weight = args.comp_entropy_weight
+    if comp_entropy_weight > 0 and not args.allow_entropy_regularizer:
+        logger.warning(
+            "Disabling composition entropy regularizer by default because it conflicts with sparse top-k usage. "
+            "Pass --allow-entropy-regularizer to force-enable."
+        )
+        comp_entropy_weight = 0.0
     comp_lr_mult = args.comp_lr_mult
+    band_diversity_weight = max(0.0, float(args.band_diversity_weight))
+    hot_tier_bias_weight = max(0.0, float(args.hot_tier_bias_weight))
+    joint_exit_loss_weight = max(0.0, float(args.joint_exit_loss_weight))
 
     step_time = time.time()
     tokens_since_log = 0
     grad_accum_steps = max(1, int(train_config.gradient_accumulation))
+    tokens_per_step_effective = (
+        train_config.micro_batch_size * train_config.max_seq_len * grad_accum_steps
+    )
+    target_tokens = args.total_tokens if args.total_tokens is not None else train_config.tokens
+    planned_total_tokens = tokens_per_step_effective * train_config.total_steps
+    naive_tokens_no_accum = (
+        train_config.micro_batch_size * train_config.max_seq_len * train_config.total_steps
+    )
+    logger.info(
+        "Token accounting: "
+        f"steps={train_config.total_steps}, micro_batch={train_config.micro_batch_size}, "
+        f"grad_accum={grad_accum_steps}, seq_len={train_config.max_seq_len}, "
+        f"effective_tokens_per_step={tokens_per_step_effective}, "
+        f"planned_total_tokens={planned_total_tokens}, target_tokens={target_tokens}"
+    )
+    if target_tokens is not None and target_tokens > 0:
+        # Hard guard against silent large undertraining/overtraining.
+        if planned_total_tokens < int(0.5 * target_tokens):
+            raise ValueError(
+                "Planned token budget is <50% of target. "
+                "Check total_steps / gradient_accumulation accounting."
+            )
+        if planned_total_tokens > int(2.0 * target_tokens):
+            raise ValueError(
+                "Planned token budget is >200% of target. "
+                "Check total_steps / gradient_accumulation accounting."
+            )
+        if grad_accum_steps > 1 and abs(naive_tokens_no_accum - target_tokens) <= tokens_per_step_effective:
+            logger.info(
+                "Token accounting sanity: step math already includes gradient accumulation; "
+                "loop accumulation is expected and not double-counted."
+            )
     moe_aux_loss_weight = 0.0
     if is_compositional and model_config.primitive_config.moe_config is not None:
         moe_aux_loss_weight = float(model_config.primitive_config.moe_config.aux_loss_weight)
@@ -767,8 +1054,8 @@ def train_v2(args: argparse.Namespace) -> None:
             phase1_top_k=args.phase1_top_k
         )
         if is_moe and runtime_top_k is None:
-            # In MoE, phase-1 "full mix" means using all experts.
-            runtime_top_k = router_n_experts
+            # Default to configured sparse expert top-k for MoE.
+            runtime_top_k = router_top_k_final
         runtime_top_k_fc1 = get_runtime_top_k(
             step,
             train_config.total_steps,
@@ -837,6 +1124,12 @@ def train_v2(args: argparse.Namespace) -> None:
                 set_composition_requires_grad(raw_model, True)
                 set_primitive_requires_grad(raw_model, not freeze_primitives_phase2)
 
+            cache_frozen_primitives = phase >= 2 and freeze_primitives_phase2
+            for layer in raw_model.layers:
+                ffn = layer.ffn
+                if hasattr(ffn, "cache_selected_primitives"):
+                    ffn.cache_selected_primitives = cache_frozen_primitives
+
             # Diagnostic: check if grads are enabled and flowing
             if step % 100 == 0:
                 comp_params = [(n, p) for n, p in raw_model.named_parameters() if "composition_weights" in n]
@@ -868,6 +1161,12 @@ def train_v2(args: argparse.Namespace) -> None:
         distill_loss_count = 0
         comp_entropy_loss_accum = 0.0
         comp_entropy_loss_count = 0
+        band_diversity_loss_accum = 0.0
+        band_diversity_loss_count = 0
+        hot_tier_bias_loss_accum = 0.0
+        hot_tier_bias_loss_count = 0
+        joint_exit_loss_accum = 0.0
+        joint_exit_loss_count = 0
         aux_loss_raw_accum = 0.0
         aux_loss_scaled_accum = 0.0
         aux_loss_count = 0
@@ -925,6 +1224,28 @@ def train_v2(args: argparse.Namespace) -> None:
                     if comp_entropy_loss is not None:
                         total_loss = total_loss + comp_entropy_weight * comp_entropy_loss
 
+                band_diversity_loss = None
+                if is_compositional and band_diversity_weight > 0 and phase >= 2:
+                    band_diversity_loss = compute_band_diversity_loss(raw_model)
+                    if band_diversity_loss is not None:
+                        total_loss = total_loss + band_diversity_weight * band_diversity_loss
+
+                hot_tier_bias_loss = None
+                if is_compositional and hot_tier_bias_weight > 0:
+                    hot_tier_bias_loss = compute_hot_tier_bias_loss(raw_model)
+                    if hot_tier_bias_loss is not None:
+                        total_loss = total_loss + hot_tier_bias_weight * hot_tier_bias_loss
+
+                joint_exit_loss = None
+                if joint_exit_loss_weight > 0:
+                    exit_confidences = outputs.get("exit_confidences")
+                    if exit_confidences is not None:
+                        joint_exit_loss = compute_joint_exit_loss(
+                            exit_confidences=exit_confidences,
+                            logits=outputs["logits"],
+                        )
+                        total_loss = total_loss + joint_exit_loss_weight * joint_exit_loss
+
             if log_timing:
                 sync_if_cuda(device)
                 fwd_s += time.perf_counter() - fwd_start
@@ -936,6 +1257,15 @@ def train_v2(args: argparse.Namespace) -> None:
             if comp_entropy_loss is not None:
                 comp_entropy_loss_accum += float(comp_entropy_loss.detach().item())
                 comp_entropy_loss_count += 1
+            if band_diversity_loss is not None:
+                band_diversity_loss_accum += float(band_diversity_loss.detach().item())
+                band_diversity_loss_count += 1
+            if hot_tier_bias_loss is not None:
+                hot_tier_bias_loss_accum += float(hot_tier_bias_loss.detach().item())
+                hot_tier_bias_loss_count += 1
+            if joint_exit_loss is not None:
+                joint_exit_loss_accum += float(joint_exit_loss.detach().item())
+                joint_exit_loss_count += 1
             if aux_loss_tensor is not None:
                 aux_raw = float(aux_loss_tensor.detach().item())
                 aux_loss_raw_accum += aux_raw
@@ -970,6 +1300,10 @@ def train_v2(args: argparse.Namespace) -> None:
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+        # Phase B.5b: Swap tiered primitive banks
+        if args.n_hot is not None and is_compositional:
+            raw_model.swap_tiers(optimizer)
+
         if log_timing:
             sync_if_cuda(device)
             opt_s = time.perf_counter() - opt_start
@@ -984,6 +1318,15 @@ def train_v2(args: argparse.Namespace) -> None:
         )
         comp_entropy_loss_value = (
             comp_entropy_loss_accum / comp_entropy_loss_count if comp_entropy_loss_count > 0 else None
+        )
+        band_diversity_loss_value = (
+            band_diversity_loss_accum / band_diversity_loss_count if band_diversity_loss_count > 0 else None
+        )
+        hot_tier_bias_loss_value = (
+            hot_tier_bias_loss_accum / hot_tier_bias_loss_count if hot_tier_bias_loss_count > 0 else None
+        )
+        joint_exit_loss_value = (
+            joint_exit_loss_accum / joint_exit_loss_count if joint_exit_loss_count > 0 else None
         )
         aux_loss_raw_value = (
             aux_loss_raw_accum / aux_loss_count if aux_loss_count > 0 else None
@@ -1034,6 +1377,8 @@ def train_v2(args: argparse.Namespace) -> None:
                     "active_primitives": float(active_primitives or n_primitives),
                     "uniform_topk": float(1.0 if (phase == 1 and args.uniform_topk_phase1) else 0.0),
                     "primitive_entropy": mean_entropy,
+                    "moe_enabled": float(1.0 if is_moe else 0.0),
+                    "checkpoint_ffn": float(1.0 if model_config.checkpoint_ffn else 0.0),
                 })
 
                 if log_comp_stats:
@@ -1051,6 +1396,15 @@ def train_v2(args: argparse.Namespace) -> None:
                 if comp_entropy_loss_value is not None:
                     log_dict["comp_entropy_loss"] = comp_entropy_loss_value
                     log_dict["comp_entropy_weight"] = comp_entropy_weight
+                if band_diversity_loss_value is not None:
+                    log_dict["band_diversity_loss"] = band_diversity_loss_value
+                    log_dict["band_diversity_weight"] = band_diversity_weight
+                if hot_tier_bias_loss_value is not None:
+                    log_dict["hot_tier_bias_loss"] = hot_tier_bias_loss_value
+                    log_dict["hot_tier_bias_weight"] = hot_tier_bias_weight
+                if joint_exit_loss_value is not None:
+                    log_dict["joint_exit_loss"] = joint_exit_loss_value
+                    log_dict["joint_exit_weight"] = joint_exit_loss_weight
 
             if log_timing:
                 log_dict.update({
@@ -1110,6 +1464,12 @@ def train_v2(args: argparse.Namespace) -> None:
                 "val_ppl": val_ppl,
                 "wall_clock_hours": (time.time() - training_start_time) / 3600,
             }
+            # Phase B.5d: VRAM efficiency metric
+            if device.startswith("cuda"):
+                peak_vram_gb = torch.cuda.max_memory_allocated() / 1e9
+                val_log["peak_vram_gb"] = peak_vram_gb
+                if peak_vram_gb > 0:
+                    val_log["val_loss_per_vram_gb"] = avg_val / peak_vram_gb
             logger.metric(step, val_log)
             logger.info(f"step {step} val_loss={avg_val:.4f} val_ppl={val_ppl:.2f}")
 
@@ -1186,6 +1546,11 @@ def main() -> None:
     parser.add_argument("--teacher-ckpt", type=str, default=None, help="Dense teacher checkpoint path")
     parser.add_argument("--distill-temp", type=float, default=1.0, help="Distillation temperature")
     parser.add_argument("--resume", type=str, default=None, help="Resume training from checkpoint path")
+    parser.add_argument("--checkpoint-ffn", dest="checkpoint_ffn", action="store_true",
+                        help="Enable FFN gradient checkpointing")
+    parser.add_argument("--no-checkpoint-ffn", dest="checkpoint_ffn", action="store_false",
+                        help="Disable FFN gradient checkpointing for max throughput")
+    parser.set_defaults(checkpoint_ffn=None)
 
     parser.add_argument("--rank-start", type=int, default=None)
     parser.add_argument("--rank-mid", type=int, default=None)
@@ -1202,6 +1567,10 @@ def main() -> None:
     parser.add_argument("--uniform-topk-phase1", action="store_true", help="Use uniform weights for top-k in phase1")
     parser.add_argument("--topk-cache-steps", type=int, default=None, help="Cache top-k indices for N steps")
     parser.add_argument("--composition-temp", type=float, default=None, help="Override composition softmax temperature")
+    parser.add_argument("--forward-fast-mode", type=str, choices=["auto", "on", "off"], default=None,
+                        help="Compositional FFN execution path")
+    parser.add_argument("--forward-fast-min-topk", type=int, default=None,
+                        help="Minimum top-k for forward_fast auto mode")
     parser.add_argument("--log-comp-stats", action="store_true", help="Log composition weight statistics")
     parser.add_argument("--freeze-primitives-phase2", dest="freeze_primitives_phase2", action="store_true",
                         help="Freeze primitives after phase1")
@@ -1212,11 +1581,56 @@ def main() -> None:
                         help="Override composition LR multiplier in phase2+")
     parser.add_argument("--comp-entropy-weight", type=float, default=0.0,
                         help="Entropy penalty weight for composition weights (phase2+)")
+    parser.add_argument("--allow-entropy-regularizer", action="store_true",
+                        help="Allow entropy regularization with sparse top-k")
+    parser.add_argument("--band-diversity-weight", type=float, default=0.0,
+                        help="Penalty weight to reduce layer redundancy inside each primitive band")
+    parser.add_argument("--hot-tier-bias-weight", type=float, default=0.0,
+                        help="Bias composition toward hot-tier primitives when tiering is enabled")
+    parser.add_argument("--joint-exit-loss-weight", type=float, default=0.0,
+                        help="Jointly train exit gates during LM training with self-supervised certainty targets")
+    parser.add_argument("--primitive-weight-decay", type=float, default=0.0,
+                        help="Weight decay for primitive banks (default 0 to avoid dense-style drift)")
+    parser.add_argument("--moe-experts", type=int, default=None,
+                        help="Enable token-level MoE routing with this many experts")
+    parser.add_argument("--moe-top-k", type=int, default=None,
+                        help="Top-k experts per token for MoE routing")
+    parser.add_argument("--moe-router-type", type=str, choices=["linear", "mlp"], default="linear",
+                        help="Router type for MoE")
+    parser.add_argument("--moe-router-hidden-dim", type=int, default=None,
+                        help="Hidden size for MLP MoE router")
+    parser.add_argument("--moe-aux-loss-weight", type=float, default=0.01,
+                        help="Auxiliary load-balancing weight for MoE")
+    parser.add_argument("--no-moe-load-balancing", action="store_true",
+                        help="Disable MoE load balancing loss")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 matmul")
 
     parser.add_argument("--progressive-unfreeze", action="store_true")
     parser.add_argument("--log-timing", action="store_true", help="Log timing breakdowns per step")
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes")
+    parser.add_argument("--prefetch-factor", type=int, default=None, help="Prefetch factor per DataLoader worker")
+    parser.add_argument("--persistent-workers", dest="persistent_workers", action="store_true",
+                        help="Enable persistent DataLoader workers")
+    parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false",
+                        help="Disable persistent DataLoader workers")
+    parser.set_defaults(persistent_workers=None)
+    parser.add_argument("--tokenize-batch-size", type=int, default=64,
+                        help="Number of raw texts tokenized together in streaming loader")
+
+    # Phase B.5b: Tiered primitive bank (VRAM-efficient)
+    parser.add_argument("--n-hot", type=int, default=None,
+                        help="Number of hot primitives in VRAM (None = no tiering)")
+    parser.add_argument("--swap-interval", type=int, default=100,
+                        help="Steps between hot/warm primitive swaps")
+
+    # Phase B.5c: Early exit
+    parser.add_argument("--enable-early-exit", action="store_true",
+                        help="Enable early exit gates on transformer blocks")
+    parser.add_argument("--exit-threshold", type=float, default=0.5,
+                        help="Skip confidence threshold for early exit")
+    parser.add_argument("--train-exit-gates", action="store_true",
+                        help="Post-hoc gate training mode: freeze model, train only gates")
 
     args = parser.parse_args()
     args.tf32 = not args.no_tf32

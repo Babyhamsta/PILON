@@ -68,7 +68,7 @@ class PrimitiveConfig:
     composition_type: str = "static_per_layer"
 
     # Softmax temperature for composition weights
-    temperature: float = 0.5
+    temperature: float = 1.0
 
     # Activation function
     activation: str = "gelu"
@@ -77,13 +77,19 @@ class PrimitiveConfig:
     # "auto": use forward_fast only when mixing is effectively dense
     # "on": always use forward_fast (highest throughput, more VRAM)
     # "off": never use forward_fast (lowest VRAM)
-    forward_fast_mode: str = "auto"
+    forward_fast_mode: str = "on"
     # In "auto" mode, require top_k >= this threshold to use forward_fast.
     # None defaults to n_primitives (dense only).
-    forward_fast_min_topk: Optional[int] = None
+    forward_fast_min_topk: Optional[int] = 1
 
     # MoE configuration (Phase B) - None = Phase A static composition
     moe_config: Optional[MoEConfig] = None
+
+    # Tiered primitive bank (Phase B.5b) - VRAM-efficient loading
+    # None = no tiering, all primitives in VRAM
+    n_hot: Optional[int] = None
+    # Steps between hot/warm primitive swaps
+    swap_interval: int = 100
 
 
 @dataclass
@@ -106,13 +112,17 @@ class ModelConfig:
 
     # Normalization
     norm_type: str = "rmsnorm"
-    checkpoint_ffn: bool = True
+    checkpoint_ffn: bool = False
 
     # FFN type: "compositional" or "standard"
     ffn_type: str = "compositional"
 
     # Compositional FFN config (only used if ffn_type == "compositional")
     primitive_config: PrimitiveConfig = field(default_factory=PrimitiveConfig)
+
+    # Early exit (Phase B.5c) - skip FFN for easy tokens during inference
+    enable_early_exit: bool = False
+    exit_threshold: float = 0.5
 
     def get_baseline_config(self) -> "ModelConfig":
         """Return a copy with standard FFN for baseline comparison."""
@@ -168,9 +178,9 @@ class TrainingConfig:
     gradient_accumulation: int = 8
     effective_batch_size: int = 64  # micro_batch_size * gradient_accumulation
     max_seq_len: int = 512
-    num_workers: int = 0
-    prefetch_factor: int = 2
-    persistent_workers: bool = False
+    num_workers: int = 4
+    prefetch_factor: int = 4
+    persistent_workers: bool = True
 
     # Precision & stability
     precision: str = "bf16"

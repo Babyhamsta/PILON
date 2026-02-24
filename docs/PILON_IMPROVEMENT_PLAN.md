@@ -1,8 +1,8 @@
 # PILON-R Improvement Plan: Exploiting What Makes PILON Different
 
-**Date:** February 23, 2026  
-**Status:** Phase B Complete -> Phase B.5 (Structural Advantages)  
-**Progress:** B.5a complete (compute path fixes landed and validated on February 23, 2026).  
+**Date:** February 23, 2026
+**Status:** Phase B.5 implementation COMPLETE (B.5a through B.5e)
+**Progress:** All phases implemented and tested. Ready for 360M crossover experiment.
 **Hardware:** RTX 4070 (12GB VRAM)
 
 ---
@@ -388,10 +388,10 @@ python -m pilon_r.train --model-size 360m --ffn-type compositional \
 | Phase | Question | If YES | If NO |
 |-------|----------|--------|-------|
 | B.5a: Compute fix (DONE) | Is PILON wasting FLOPS? | tok/s jumps, confirms overhead was artificial | Overhead is elsewhere (memory bandwidth?) |
-| B.5b: Tiered loading | Can PILON use less VRAM? | Core structural advantage confirmed | Swapping overhead kills benefit |
-| B.5c: Early exit | Can PILON skip layers cheaply? | Inference speed advantage | Exit gates can't predict well enough |
-| B.5d: 360M crossover | Does PILON win on efficiency at scale? | **Thesis confirmed** — PILON is more efficient | PILON's overhead outweighs structural advantages |
-| B.5e: Benchmarks | Is this reproducible? | Publishable results | Need more iteration |
+| B.5b: Tiered loading (DONE) | Can PILON use less VRAM? | Core structural advantage confirmed | Swapping overhead kills benefit |
+| B.5c: Early exit (DONE) | Can PILON skip layers cheaply? | Inference speed advantage | Exit gates can't predict well enough |
+| B.5d: 360M crossover (READY) | Does PILON win on efficiency at scale? | **Thesis confirmed** — PILON is more efficient | PILON's overhead outweighs structural advantages |
+| B.5e: Benchmarks (DONE) | Is this reproducible? | Publishable results | Need more iteration |
 
 **The whole plan stands or falls on B.5d.** Everything before it is infrastructure to make B.5d a fair test. If PILON-360M with tiered loading and early exit doesn't beat dense-360M on quality-per-VRAM-GB, the architecture isn't pulling its weight at currently testable scales.
 
