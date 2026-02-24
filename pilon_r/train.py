@@ -17,7 +17,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -555,6 +555,85 @@ def apply_phase_lrs_with_override(
     for group in optimizer.param_groups:
         if group.get("name") == "composition":
             group["lr"] = base_lr * composition_lr_mult
+
+
+def capture_inactive_primitive_rows(
+    optimizer: AdamW,
+    grad_eps: float = 0.0,
+) -> Dict[nn.Parameter, Dict[str, torch.Tensor]]:
+    """
+    Snapshot inactive primitive rows so AdamW doesn't decay their moments.
+
+    This preserves row states for sparse primitive updates where many rows
+    receive exactly zero gradients in a step.
+    """
+    snapshots: Dict[nn.Parameter, Dict[str, torch.Tensor]] = {}
+    for group in optimizer.param_groups:
+        if group.get("name") != "primitives":
+            continue
+        for param in group.get("params", []):
+            grad = param.grad
+            if grad is None or grad.ndim < 2 or grad.size(0) == 0:
+                continue
+
+            row_active = grad.detach().abs().reshape(grad.size(0), -1).amax(dim=1) > grad_eps
+            if bool(row_active.all()):
+                continue
+
+            inactive_rows = torch.nonzero(~row_active, as_tuple=False).squeeze(-1)
+            if inactive_rows.numel() == 0:
+                continue
+
+            snap: Dict[str, torch.Tensor] = {
+                "rows": inactive_rows,
+                "param": param.data.index_select(0, inactive_rows).clone(),
+            }
+            state = optimizer.state.get(param)
+            if state is not None:
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    value = state.get(key)
+                    if (
+                        torch.is_tensor(value)
+                        and value.ndim >= 1
+                        and value.size(0) == param.size(0)
+                    ):
+                        snap[key] = value.index_select(0, inactive_rows).clone()
+            snapshots[param] = snap
+    return snapshots
+
+
+def restore_inactive_primitive_rows(
+    optimizer: AdamW,
+    snapshots: Dict[nn.Parameter, Dict[str, torch.Tensor]],
+) -> None:
+    """
+    Restore inactive primitive rows after optimizer.step().
+    """
+    if not snapshots:
+        return
+    for param, snap in snapshots.items():
+        rows = snap.get("rows")
+        saved_param = snap.get("param")
+        if rows is None or saved_param is None or rows.numel() == 0:
+            continue
+
+        param.data.index_copy_(0, rows, saved_param)
+
+        state = optimizer.state.get(param)
+        if state is None:
+            continue
+
+        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            saved_state = snap.get(key)
+            current_state = state.get(key)
+            if (
+                saved_state is None
+                or not torch.is_tensor(current_state)
+                or current_state.ndim < 1
+                or current_state.size(0) != param.size(0)
+            ):
+                continue
+            current_state.index_copy_(0, rows, saved_state)
 
 
 def kl_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -1295,11 +1374,29 @@ def train_v2(args: argparse.Namespace) -> None:
             scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
         grad_norm_value = float(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
+
+        sparse_primitive_step = (
+            is_compositional
+            and (
+                top_k_final < n_primitives
+                or (active_primitives is not None and active_primitives < n_primitives)
+                or (runtime_top_k_fc1 is not None and runtime_top_k_fc1 < n_primitives)
+                or (runtime_top_k_fc2 is not None and runtime_top_k_fc2 < n_primitives)
+            )
+        )
+        inactive_row_snapshots: Dict[nn.Parameter, Dict[str, torch.Tensor]] = {}
+        if sparse_primitive_step:
+            inactive_row_snapshots = capture_inactive_primitive_rows(optimizer)
+
         if use_scaler:
             scaler.step(optimizer)
             scaler.update()
         else:
             optimizer.step()
+
+        if inactive_row_snapshots:
+            restore_inactive_primitive_rows(optimizer, inactive_row_snapshots)
+
         optimizer.zero_grad(set_to_none=True)
 
         # Phase B.5b: Swap tiered primitive banks
