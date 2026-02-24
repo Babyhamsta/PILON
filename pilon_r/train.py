@@ -491,7 +491,9 @@ def compute_joint_exit_loss(
         dtype=exit_confidences.dtype,
     ).view(n_layers, 1, 1, 1)
     target = (certainty.unsqueeze(0) * layer_scale).clamp(0.0, 1.0)
-    return F.binary_cross_entropy(exit_confidences, target)
+    # Disable autocast — BCE is not autocast-safe
+    with torch.cuda.amp.autocast(enabled=False):
+        return F.binary_cross_entropy(exit_confidences.float(), target.float())
 
 
 def build_optimizer(
@@ -1053,8 +1055,8 @@ def train_v2(args: argparse.Namespace) -> None:
             phase1_sparse=args.phase1_sparse,
             phase1_top_k=args.phase1_top_k
         )
-        if is_moe and runtime_top_k is None:
-            # Default to configured sparse expert top-k for MoE.
+        if is_moe:
+            # Keep MoE routing sparse and stable unless explicitly changed in config.
             runtime_top_k = router_top_k_final
         runtime_top_k_fc1 = get_runtime_top_k(
             step,

@@ -924,6 +924,8 @@ class MoECompositionalFFN(nn.Module):
 
         # Runtime top-k (None falls back to config top_k_experts).
         effective_top_k = self.runtime_top_k
+        top_k_probs: Optional[torch.Tensor] = None
+        top_k_indices: Optional[torch.Tensor] = None
         if effective_top_k is None:
             effective_top_k = self.top_k_experts
         effective_top_k = int(max(1, min(self.n_experts, int(effective_top_k))))
@@ -932,7 +934,6 @@ class MoECompositionalFFN(nn.Module):
             effective_top_k = self.n_experts
             effective_router_probs = router_probs
             expert_mask = torch.ones_like(router_probs)
-            top_k_indices = None
         else:
             # Select top-k experts per token and mask others
             top_k_probs, top_k_indices = torch.topk(
@@ -977,43 +978,148 @@ class MoECompositionalFFN(nn.Module):
         n_tokens = batch_size * seq_len
         x_flat = x.reshape(n_tokens, self.d_model)
         router_flat = effective_router_probs.reshape(n_tokens, self.n_experts)
+        use_tiered_bank_fallback = hasattr(fc1_bank, "hot_indices") or hasattr(fc2_bank, "hot_indices")
 
-        if effective_top_k < self.n_experts and top_k_indices is not None:
+        if effective_top_k < self.n_experts and top_k_indices is not None and top_k_probs is not None:
             # Token-grouped sparse expert execution:
             # each active expert only processes tokens routed to it.
             output_flat = torch.zeros(n_tokens, self.d_model, device=x.device, dtype=x.dtype)
-            active_experts = torch.unique(top_k_indices.reshape(-1), sorted=False)
+            if use_tiered_bank_fallback:
+                # Tiered banks require bank-native top-k remapping.
+                active_experts = torch.unique(top_k_indices.reshape(-1), sorted=False)
+                for expert_idx in active_experts.tolist():
+                    token_weights = router_flat[:, expert_idx]
+                    token_idx = torch.nonzero(token_weights > 0, as_tuple=False).squeeze(-1)
+                    if token_idx.numel() == 0:
+                        continue
 
-            for expert_idx in active_experts.tolist():
-                token_weights = router_flat[:, expert_idx]
-                token_idx = torch.nonzero(token_weights > 0, as_tuple=False).squeeze(-1)
-                if token_idx.numel() == 0:
-                    continue
+                    expert_inputs = x_flat.index_select(0, token_idx).unsqueeze(0)  # (1, T_e, d_model)
+                    fc1_e = fc1_bank.forward_topk_fused(
+                        expert_inputs,
+                        fc1_expert_weights[expert_idx],
+                        top_k=primitive_top_k,
+                        top_indices=fc1_idx[expert_idx],
+                    )
+                    fc1_e = self.activation(fc1_e)
+                    fc2_e = fc2_bank.forward_topk_fused(
+                        fc1_e,
+                        fc2_expert_weights[expert_idx],
+                        top_k=primitive_top_k,
+                        top_indices=fc2_idx[expert_idx],
+                    ).squeeze(0)  # (T_e, d_model)
 
-                expert_inputs = x_flat.index_select(0, token_idx).unsqueeze(0)  # (1, T_e, d_model)
-
-                fc1_e = self._bank_forward_experts_fused(
-                    expert_inputs,
-                    fc1_bank,
-                    expert_weights=None,
-                    expert_indices=fc1_idx[expert_idx:expert_idx + 1],
-                    top_k=primitive_top_k,
-                    expert_top_weights=fc1_top_weights[expert_idx:expert_idx + 1],
+                    token_w = token_weights.index_select(0, token_idx).to(dtype=fc2_e.dtype).unsqueeze(-1)
+                    contrib = fc2_e * token_w
+                    output_flat.index_add_(0, token_idx, contrib.to(dtype=output_flat.dtype))
+            else:
+                # Non-tiered path: batch active experts together to reduce kernel launch overhead.
+                assign_expert = top_k_indices.reshape(-1)
+                assign_token = (
+                    torch.arange(n_tokens, device=x.device, dtype=torch.long)
+                    .unsqueeze(1)
+                    .expand(-1, effective_top_k)
+                    .reshape(-1)
                 )
-                fc1_e = self.activation(fc1_e)
+                assign_weight = top_k_probs.reshape(-1)
 
-                fc2_e = self._bank_forward_experts_fused(
-                    fc1_e,
-                    fc2_bank,
-                    expert_weights=None,
-                    expert_indices=fc2_idx[expert_idx:expert_idx + 1],
+                sort_idx = torch.argsort(assign_expert)
+                assign_expert = assign_expert.index_select(0, sort_idx)
+                assign_token = assign_token.index_select(0, sort_idx)
+                assign_weight = assign_weight.index_select(0, sort_idx)
+
+                counts = torch.bincount(assign_expert, minlength=self.n_experts)
+                active_experts = torch.nonzero(counts > 0, as_tuple=False).squeeze(-1)
+                if active_experts.numel() > 0:
+                    counts_active = counts.index_select(0, active_experts)
+                    max_tokens_per_expert = int(counts_active.max().item())
+                    n_active = int(active_experts.numel())
+
+                    expert_inputs = torch.zeros(
+                        n_active,
+                        max_tokens_per_expert,
+                        self.d_model,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    token_buf = torch.zeros(
+                        n_active,
+                        max_tokens_per_expert,
+                        device=x.device,
+                        dtype=torch.long,
+                    )
+                    weight_buf = torch.zeros(
+                        n_active,
+                        max_tokens_per_expert,
+                        device=x.device,
+                        dtype=assign_weight.dtype,
+                    )
+
+                    start = 0
+                    for row_idx, cnt in enumerate(counts_active.tolist()):
+                        cnt_i = int(cnt)
+                        if cnt_i <= 0:
+                            continue
+                        end = start + cnt_i
+                        tok = assign_token[start:end]
+                        expert_inputs[row_idx, :cnt_i] = x_flat.index_select(0, tok)
+                        token_buf[row_idx, :cnt_i] = tok
+                        weight_buf[row_idx, :cnt_i] = assign_weight[start:end]
+                        start = end
+
+                    active_fc1_idx = fc1_idx.index_select(0, active_experts)
+                    active_fc2_idx = fc2_idx.index_select(0, active_experts)
+                    active_fc1_w = fc1_top_weights.index_select(0, active_experts)
+                    active_fc2_w = fc2_top_weights.index_select(0, active_experts)
+
+                    fc1_e = self._bank_forward_experts_fused(
+                        expert_inputs,
+                        fc1_bank,
+                        expert_weights=None,
+                        expert_indices=active_fc1_idx,
+                        top_k=primitive_top_k,
+                        expert_top_weights=active_fc1_w,
+                    )
+                    fc1_e = self.activation(fc1_e)
+                    fc2_e = self._bank_forward_experts_fused(
+                        fc1_e,
+                        fc2_bank,
+                        expert_weights=None,
+                        expert_indices=active_fc2_idx,
+                        top_k=primitive_top_k,
+                        expert_top_weights=active_fc2_w,
+                    )
+
+                    valid_mask = (
+                        torch.arange(max_tokens_per_expert, device=x.device).unsqueeze(0)
+                        < counts_active.unsqueeze(1)
+                    )
+                    token_idx_flat = token_buf.masked_select(valid_mask)
+                    contrib = fc2_e * weight_buf.to(dtype=fc2_e.dtype).unsqueeze(-1)
+                    contrib_flat = contrib[valid_mask]
+                    output_flat.index_add_(0, token_idx_flat, contrib_flat.to(dtype=output_flat.dtype))
+        elif use_tiered_bank_fallback:
+            # Tiered banks keep only hot primitives on-device; use bank-native
+            # fused forward so global primitive indices can be remapped safely.
+            expert_outputs = []
+            for expert_idx in range(self.n_experts):
+                h_expert = fc1_bank.forward_topk_fused(
+                    x,
+                    fc1_expert_weights[expert_idx],
                     top_k=primitive_top_k,
-                    expert_top_weights=fc2_top_weights[expert_idx:expert_idx + 1],
-                ).squeeze(0)  # (T_e, d_model)
+                    top_indices=fc1_idx[expert_idx],
+                )
+                h_expert = self.activation(h_expert)
+                out_expert = fc2_bank.forward_topk_fused(
+                    h_expert,
+                    fc2_expert_weights[expert_idx],
+                    top_k=primitive_top_k,
+                    top_indices=fc2_idx[expert_idx],
+                )
+                expert_outputs.append(out_expert.view(n_tokens, self.d_model))
 
-                token_w = token_weights.index_select(0, token_idx).to(dtype=fc2_e.dtype).unsqueeze(-1)
-                contrib = fc2_e * token_w
-                output_flat.index_add_(0, token_idx, contrib.to(dtype=output_flat.dtype))
+            expert_outs = torch.stack(expert_outputs, dim=0)  # (E, T, d_model)
+            router_dense = router_flat.transpose(0, 1).unsqueeze(-1).to(dtype=expert_outs.dtype)
+            output_flat = (expert_outs * router_dense).sum(dim=0)
         else:
             # Dense expert execution across all experts.
             x_expert = x_flat.unsqueeze(0).expand(self.n_experts, -1, -1)  # (E, T, d_model)
