@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import AdamW
+from torch.optim import Optimizer
 from torch.amp import GradScaler, autocast
 
 from .core.config import (
@@ -496,11 +496,172 @@ def compute_joint_exit_loss(
         return F.binary_cross_entropy(exit_confidences.float(), target.float())
 
 
+class SparseAwareAdamW(Optimizer):
+    """
+    AdamW variant with row-sparse updates for primitive banks.
+
+    For parameter groups with `row_sparse=True`, updates are applied only to rows
+    with non-zero gradients and maintain per-row optimizer step counters.
+    """
+
+    def __init__(
+        self,
+        params,
+        betas: Tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+    ):
+        defaults = dict(
+            lr=3e-4,
+            betas=betas,
+            eps=eps,
+            weight_decay=0.0,
+            row_sparse=False,
+            grad_eps=0.0,
+        )
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _as_int_step(step_value: Any) -> int:
+        if torch.is_tensor(step_value):
+            return int(step_value.item())
+        return int(step_value)
+
+    @torch.no_grad()
+    def _dense_update(
+        self,
+        param: nn.Parameter,
+        grad: torch.Tensor,
+        group: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> None:
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param)
+            state["exp_avg_sq"] = torch.zeros_like(param)
+        elif "step" not in state:
+            state["step"] = 0
+
+        lr = float(group["lr"])
+        beta1, beta2 = group["betas"]
+        eps = float(group["eps"])
+        weight_decay = float(group["weight_decay"])
+
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        step = self._as_int_step(state["step"]) + 1
+        state["step"] = step
+
+        grad = grad.to(dtype=exp_avg.dtype)
+
+        if weight_decay != 0.0:
+            param.data.mul_(1.0 - lr * weight_decay)
+
+        exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+        bias_correction1 = 1.0 - beta1 ** step
+        bias_correction2 = 1.0 - beta2 ** step
+        step_size = lr / bias_correction1
+        denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+        param.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+    @torch.no_grad()
+    def _row_sparse_update(
+        self,
+        param: nn.Parameter,
+        grad: torch.Tensor,
+        group: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> None:
+        if param.ndim < 2 or param.size(0) == 0:
+            self._dense_update(param, grad, group, state)
+            return
+
+        if len(state) == 0:
+            state["exp_avg"] = torch.zeros_like(param)
+            state["exp_avg_sq"] = torch.zeros_like(param)
+            state["step_row"] = torch.zeros(
+                param.size(0), device=param.device, dtype=torch.long
+            )
+        elif "step_row" not in state:
+            base_step = self._as_int_step(state.get("step", 0))
+            state["step_row"] = torch.full(
+                (param.size(0),), base_step, device=param.device, dtype=torch.long
+            )
+
+        grad_eps = float(group.get("grad_eps", 0.0))
+        row_active = grad.detach().abs().reshape(param.size(0), -1).amax(dim=1) > grad_eps
+        if not bool(row_active.any()):
+            return
+
+        lr = float(group["lr"])
+        beta1, beta2 = group["betas"]
+        eps = float(group["eps"])
+        weight_decay = float(group["weight_decay"])
+
+        active_rows = torch.nonzero(row_active, as_tuple=False).squeeze(-1)
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        step_row = state["step_row"]
+
+        grad_sel = grad.index_select(0, active_rows).to(dtype=exp_avg.dtype)
+        exp_avg_sel = exp_avg.index_select(0, active_rows)
+        exp_avg_sq_sel = exp_avg_sq.index_select(0, active_rows)
+
+        step_sel = step_row.index_select(0, active_rows) + 1
+        step_row.index_copy_(0, active_rows, step_sel)
+
+        exp_avg_sel.mul_(beta1).add_(grad_sel, alpha=1.0 - beta1)
+        exp_avg_sq_sel.mul_(beta2).addcmul_(grad_sel, grad_sel, value=1.0 - beta2)
+
+        exp_avg.index_copy_(0, active_rows, exp_avg_sel)
+        exp_avg_sq.index_copy_(0, active_rows, exp_avg_sq_sel)
+
+        param_sel = param.data.index_select(0, active_rows)
+        if weight_decay != 0.0:
+            param_sel.mul_(1.0 - lr * weight_decay)
+
+        bias_correction1 = 1.0 - beta1 ** step_sel.to(dtype=exp_avg_sel.dtype)
+        bias_correction2 = 1.0 - beta2 ** step_sel.to(dtype=exp_avg_sel.dtype)
+        while bias_correction1.ndim < exp_avg_sel.ndim:
+            bias_correction1 = bias_correction1.unsqueeze(-1)
+            bias_correction2 = bias_correction2.unsqueeze(-1)
+
+        denom = exp_avg_sq_sel.sqrt().div_(torch.sqrt(bias_correction2)).add_(eps)
+        update = (exp_avg_sel / denom) * (lr / bias_correction1)
+        param_sel.add_(-update)
+        param.data.index_copy_(0, active_rows, param_sel)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            row_sparse = bool(group.get("row_sparse", False))
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                grad = param.grad
+                if grad.is_sparse:
+                    grad = grad.coalesce().to_dense()
+
+                state = self.state[param]
+                if row_sparse and param.ndim >= 2:
+                    self._row_sparse_update(param, grad, group, state)
+                else:
+                    self._dense_update(param, grad, group, state)
+
+        return loss
+
+
 def build_optimizer(
     model: PILONTransformer,
     base_lr: float,
     primitive_weight_decay: float = 0.0,
-) -> AdamW:
+) -> Optimizer:
     primitive_params = []
     composition_params = []
     base_params = []
@@ -520,16 +681,30 @@ def build_optimizer(
             "lr": base_lr,
             "weight_decay": primitive_weight_decay,
             "name": "primitives",
+            "row_sparse": True,
+            "grad_eps": 0.0,
         })
     if composition_params:
-        param_groups.append({"params": composition_params, "lr": base_lr, "weight_decay": 0.0, "name": "composition"})
+        param_groups.append({
+            "params": composition_params,
+            "lr": base_lr,
+            "weight_decay": 0.0,
+            "name": "composition",
+            "row_sparse": False,
+        })
     if base_params:
-        param_groups.append({"params": base_params, "lr": base_lr, "weight_decay": 0.1, "name": "base"})
+        param_groups.append({
+            "params": base_params,
+            "lr": base_lr,
+            "weight_decay": 0.1,
+            "name": "base",
+            "row_sparse": False,
+        })
 
-    return AdamW(param_groups, betas=(0.9, 0.95))
+    return SparseAwareAdamW(param_groups, betas=(0.9, 0.95))
 
 
-def apply_phase_lrs(optimizer: AdamW, base_lr: float, phase: int) -> None:
+def apply_phase_lrs(optimizer: Optimizer, base_lr: float, phase: int) -> None:
     if phase == 1:
         # Give composition a tiny LR even in Phase 1 to prevent state freeze
         multipliers = {"primitives": 2.0, "composition": 0.01, "base": 1.0}
@@ -544,7 +719,7 @@ def apply_phase_lrs(optimizer: AdamW, base_lr: float, phase: int) -> None:
 
 
 def apply_phase_lrs_with_override(
-    optimizer: AdamW,
+    optimizer: Optimizer,
     base_lr: float,
     phase: int,
     composition_lr_mult: Optional[float]
@@ -557,83 +732,49 @@ def apply_phase_lrs_with_override(
             group["lr"] = base_lr * composition_lr_mult
 
 
-def capture_inactive_primitive_rows(
-    optimizer: AdamW,
-    grad_eps: float = 0.0,
-) -> Dict[nn.Parameter, Dict[str, torch.Tensor]]:
-    """
-    Snapshot inactive primitive rows so AdamW doesn't decay their moments.
+def compute_sparse_lr_multiplier(
+    is_moe: bool,
+    n_primitives: int,
+    top_k_final: int,
+    runtime_top_k: Optional[int],
+    runtime_top_k_fc1: Optional[int],
+    runtime_top_k_fc2: Optional[int],
+    router_n_experts: int,
+    max_mult: float,
+) -> float:
+    if n_primitives <= 1:
+        return 1.0
 
-    This preserves row states for sparse primitive updates where many rows
-    receive exactly zero gradients in a step.
-    """
-    snapshots: Dict[nn.Parameter, Dict[str, torch.Tensor]] = {}
-    for group in optimizer.param_groups:
-        if group.get("name") != "primitives":
-            continue
-        for param in group.get("params", []):
-            grad = param.grad
-            if grad is None or grad.ndim < 2 or grad.size(0) == 0:
-                continue
+    if is_moe:
+        expert_k = runtime_top_k if runtime_top_k is not None else 1
+        expert_k = max(1, min(router_n_experts, int(expert_k)))
+        expert_frac = expert_k / float(max(1, router_n_experts))
+        primitive_k = max(1, min(n_primitives, int(top_k_final)))
+        primitive_frac = primitive_k / float(n_primitives)
+        activity = expert_frac * primitive_frac
+    else:
+        k1 = runtime_top_k_fc1 if runtime_top_k_fc1 is not None else top_k_final
+        k2 = runtime_top_k_fc2 if runtime_top_k_fc2 is not None else top_k_final
+        k1 = max(1, min(n_primitives, int(k1)))
+        k2 = max(1, min(n_primitives, int(k2)))
+        activity = 0.5 * ((k1 / float(n_primitives)) + (k2 / float(n_primitives)))
 
-            row_active = grad.detach().abs().reshape(grad.size(0), -1).amax(dim=1) > grad_eps
-            if bool(row_active.all()):
-                continue
-
-            inactive_rows = torch.nonzero(~row_active, as_tuple=False).squeeze(-1)
-            if inactive_rows.numel() == 0:
-                continue
-
-            snap: Dict[str, torch.Tensor] = {
-                "rows": inactive_rows,
-                "param": param.data.index_select(0, inactive_rows).clone(),
-            }
-            state = optimizer.state.get(param)
-            if state is not None:
-                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                    value = state.get(key)
-                    if (
-                        torch.is_tensor(value)
-                        and value.ndim >= 1
-                        and value.size(0) == param.size(0)
-                    ):
-                        snap[key] = value.index_select(0, inactive_rows).clone()
-            snapshots[param] = snap
-    return snapshots
+    mult = 1.0 / max(1e-6, activity)
+    mult = max(1.0, mult)
+    return min(max(1.0, float(max_mult)), mult)
 
 
-def restore_inactive_primitive_rows(
-    optimizer: AdamW,
-    snapshots: Dict[nn.Parameter, Dict[str, torch.Tensor]],
-) -> None:
-    """
-    Restore inactive primitive rows after optimizer.step().
-    """
-    if not snapshots:
+def apply_sparse_lr_compensation(optimizer: Optimizer, multiplier: float) -> None:
+    if multiplier <= 1.0:
         return
-    for param, snap in snapshots.items():
-        rows = snap.get("rows")
-        saved_param = snap.get("param")
-        if rows is None or saved_param is None or rows.numel() == 0:
-            continue
 
-        param.data.index_copy_(0, rows, saved_param)
-
-        state = optimizer.state.get(param)
-        if state is None:
-            continue
-
-        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-            saved_state = snap.get(key)
-            current_state = state.get(key)
-            if (
-                saved_state is None
-                or not torch.is_tensor(current_state)
-                or current_state.ndim < 1
-                or current_state.size(0) != param.size(0)
-            ):
-                continue
-            current_state.index_copy_(0, rows, saved_state)
+    comp_mult = math.sqrt(multiplier)
+    for group in optimizer.param_groups:
+        name = group.get("name")
+        if name == "primitives":
+            group["lr"] = float(group["lr"]) * multiplier
+        elif name == "composition":
+            group["lr"] = float(group["lr"]) * comp_mult
 
 
 def kl_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -645,7 +786,7 @@ def kl_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, te
 def save_checkpoint(
     path: Path,
     model: PILONTransformer,
-    optimizer: AdamW,
+    optimizer: Optimizer,
     step: int,
     config: TrainingConfig,
     scaler: Optional[GradScaler] = None
@@ -1229,8 +1370,20 @@ def train_v2(args: argparse.Namespace) -> None:
 
         # LR schedule
         base_lr = compute_base_lr(step, train_config)
+        sparse_lr_mult = 1.0
         if is_compositional:
             apply_phase_lrs_with_override(optimizer, base_lr, phase, comp_lr_mult)
+            sparse_lr_mult = compute_sparse_lr_multiplier(
+                is_moe=is_moe,
+                n_primitives=n_primitives,
+                top_k_final=top_k_final,
+                runtime_top_k=runtime_top_k,
+                runtime_top_k_fc1=runtime_top_k_fc1,
+                runtime_top_k_fc2=runtime_top_k_fc2,
+                router_n_experts=router_n_experts,
+                max_mult=float(args.sparse_lr_max_mult),
+            )
+            apply_sparse_lr_compensation(optimizer, sparse_lr_mult)
         else:
             # Simple LR for dense baseline
             for group in optimizer.param_groups:
@@ -1374,28 +1527,11 @@ def train_v2(args: argparse.Namespace) -> None:
             scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
         grad_norm_value = float(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
-
-        sparse_primitive_step = (
-            is_compositional
-            and (
-                top_k_final < n_primitives
-                or (active_primitives is not None and active_primitives < n_primitives)
-                or (runtime_top_k_fc1 is not None and runtime_top_k_fc1 < n_primitives)
-                or (runtime_top_k_fc2 is not None and runtime_top_k_fc2 < n_primitives)
-            )
-        )
-        inactive_row_snapshots: Dict[nn.Parameter, Dict[str, torch.Tensor]] = {}
-        if sparse_primitive_step:
-            inactive_row_snapshots = capture_inactive_primitive_rows(optimizer)
-
         if use_scaler:
             scaler.step(optimizer)
             scaler.update()
         else:
             optimizer.step()
-
-        if inactive_row_snapshots:
-            restore_inactive_primitive_rows(optimizer, inactive_row_snapshots)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -1464,6 +1600,13 @@ def train_v2(args: argparse.Namespace) -> None:
 
             # Compositional-specific metrics
             if is_compositional:
+                primitive_group_lr = None
+                composition_group_lr = None
+                for group in optimizer.param_groups:
+                    if group.get("name") == "primitives":
+                        primitive_group_lr = float(group.get("lr", 0.0))
+                    elif group.get("name") == "composition":
+                        composition_group_lr = float(group.get("lr", 0.0))
                 entropy_vals = model.get_all_entropy()
                 mean_entropy = sum(entropy_vals.values()) / max(1, len(entropy_vals)) if entropy_vals else 0.0
 
@@ -1478,7 +1621,12 @@ def train_v2(args: argparse.Namespace) -> None:
                     "primitive_entropy": mean_entropy,
                     "moe_enabled": float(1.0 if is_moe else 0.0),
                     "checkpoint_ffn": float(1.0 if model_config.checkpoint_ffn else 0.0),
+                    "sparse_lr_mult": float(sparse_lr_mult),
                 })
+                if primitive_group_lr is not None:
+                    log_dict["primitive_lr"] = primitive_group_lr
+                if composition_group_lr is not None:
+                    log_dict["composition_lr"] = composition_group_lr
 
                 if log_comp_stats:
                     k1 = runtime_top_k_fc1 if runtime_top_k_fc1 is not None else n_primitives
@@ -1690,6 +1838,8 @@ def main() -> None:
                         help="Jointly train exit gates during LM training with self-supervised certainty targets")
     parser.add_argument("--primitive-weight-decay", type=float, default=0.0,
                         help="Weight decay for primitive banks (default 0 to avoid dense-style drift)")
+    parser.add_argument("--sparse-lr-max-mult", type=float, default=8.0,
+                        help="Maximum LR multiplier for sparse primitive/composition updates")
     parser.add_argument("--moe-experts", type=int, default=None,
                         help="Enable token-level MoE routing with this many experts")
     parser.add_argument("--moe-top-k", type=int, default=None,
