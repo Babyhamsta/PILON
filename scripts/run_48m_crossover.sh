@@ -67,7 +67,7 @@ python -m pilon_r.train \
     --model-size 48m \
     --ffn-type compositional \
     --phase1-sparse \
-    --phase1-top-k 2 \
+    --phase1-top-k 8 \
     ${PILON_FLAGS} \
     --total-tokens ${TOTAL_TOKENS} \
     --batch-size ${BATCH_SIZE} \
