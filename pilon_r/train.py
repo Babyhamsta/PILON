@@ -908,6 +908,17 @@ def train_v2(args: argparse.Namespace) -> None:
     if args.exit_threshold is not None:
         model_config.exit_threshold = args.exit_threshold
 
+    # Ternary quantization (BitNet b1.58)
+    if model_config.ffn_type == "compositional":
+        if getattr(args, 'ternary', False):
+            model_config.primitive_config.ternary_primitives = True
+        if getattr(args, 'use_subln', False):
+            model_config.primitive_config.use_subln = True
+        if getattr(args, 'use_squared_relu', False):
+            model_config.primitive_config.use_squared_relu = True
+        if getattr(args, 'activation_bits', None) is not None:
+            model_config.primitive_config.activation_bits = args.activation_bits
+
     # Override sequence length if specified
     if args.seq_len is not None:
         model_config.max_seq_len = args.seq_len
@@ -969,6 +980,14 @@ def train_v2(args: argparse.Namespace) -> None:
     is_compositional = model_config.ffn_type == "compositional"
     if not is_compositional:
         logger.info("Training with standard FFN (dense baseline)")
+
+    # Log ternary config
+    if is_compositional and model_config.primitive_config.ternary_primitives:
+        pc = model_config.primitive_config
+        logger.info(
+            f"Ternary quantization ENABLED: activation_bits={pc.activation_bits}, "
+            f"use_subln={pc.use_subln}, use_squared_relu={pc.use_squared_relu}"
+        )
 
     # Build model
     model = create_model(model_config)
@@ -1101,6 +1120,9 @@ def train_v2(args: argparse.Namespace) -> None:
 
     if args.compile:
         try:
+            # Allow scalar outputs (e.g. scale.item() in quantization) to be
+            # captured in the graph instead of causing graph breaks.
+            torch._dynamo.config.capture_scalar_outputs = True
             model = torch.compile(model)
             logger.info("Enabled torch.compile for model")
         except Exception as exc:
@@ -1407,6 +1429,14 @@ def train_v2(args: argparse.Namespace) -> None:
         grad_norm_value = 0.0
 
         optimizer.zero_grad(set_to_none=True)
+
+        # Pre-quantize ternary weights once per step (reused across micro-batches)
+        if is_compositional and hasattr(raw_model, 'primitive_banks'):
+            for bank in raw_model.primitive_banks.fc1_banks.values():
+                bank.prepare_q_cache()
+            for bank in raw_model.primitive_banks.fc2_banks.values():
+                bank.prepare_q_cache()
+
         for _ in range(grad_accum_steps):
             # Get micro-batch
             if log_timing:
@@ -1534,6 +1564,13 @@ def train_v2(args: argparse.Namespace) -> None:
             optimizer.step()
 
         optimizer.zero_grad(set_to_none=True)
+
+        # Invalidate ternary weight cache (weights changed after optimizer step)
+        if is_compositional and hasattr(raw_model, 'primitive_banks'):
+            for bank in raw_model.primitive_banks.fc1_banks.values():
+                bank.invalidate_q_cache()
+            for bank in raw_model.primitive_banks.fc2_banks.values():
+                bank.invalidate_q_cache()
 
         # Phase B.5b: Swap tiered primitive banks
         if args.n_hot is not None and is_compositional:
@@ -1880,6 +1917,16 @@ def main() -> None:
                         help="Skip confidence threshold for early exit")
     parser.add_argument("--train-exit-gates", action="store_true",
                         help="Post-hoc gate training mode: freeze model, train only gates")
+
+    # Ternary quantization (BitNet b1.58)
+    parser.add_argument("--ternary", action="store_true",
+                        help="Enable ternary weight quantization for primitive banks")
+    parser.add_argument("--activation-bits", type=int, default=8,
+                        help="Activation quantization bitwidth (0 = disable)")
+    parser.add_argument("--use-subln", action="store_true",
+                        help="Enable SubLN normalization for ternary stability")
+    parser.add_argument("--use-squared-relu", action="store_true",
+                        help="Use squared ReLU activation (sparser, pairs with ternary)")
 
     args = parser.parse_args()
     args.tf32 = not args.no_tf32

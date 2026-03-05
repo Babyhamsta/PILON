@@ -238,6 +238,8 @@ class TransformerBlock(nn.Module):
         # Early exit params (Phase B.5c)
         enable_early_exit: bool = False,
         exit_threshold: float = 0.5,
+        # Ternary stability
+        use_subln: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -282,7 +284,8 @@ class TransformerBlock(nn.Module):
             moe_config=moe_config,
             temperature=temperature,
             forward_fast_mode=forward_fast_mode,
-            forward_fast_min_topk=forward_fast_min_topk
+            forward_fast_min_topk=forward_fast_min_topk,
+            use_subln=use_subln,
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -465,12 +468,25 @@ class PILONTransformer(nn.Module):
                 share_fc1_fc2=pc.share_fc1_fc2,
                 n_hot=pc.n_hot,
                 swap_interval=pc.swap_interval,
+                ternary=pc.ternary_primitives,
+                activation_bits=pc.activation_bits,
             )
 
         # Get MoE config if present
         moe_config = None
         if config.ffn_type == "compositional" and config.primitive_config.moe_config is not None:
             moe_config = config.primitive_config.moe_config
+
+        # Resolve activation string (handle use_squared_relu override)
+        if config.ffn_type == "compositional":
+            pc = config.primitive_config
+            activation_str = pc.activation
+            if pc.use_squared_relu:
+                activation_str = "squared_relu"
+            use_subln = pc.use_subln
+        else:
+            activation_str = "gelu"
+            use_subln = False
 
         # Transformer blocks
         self.layers = nn.ModuleList([
@@ -489,7 +505,7 @@ class PILONTransformer(nn.Module):
                 top_k=config.primitive_config.top_k if config.ffn_type == "compositional" else 0,
                 top_k_fc1=config.primitive_config.top_k_fc1 if config.ffn_type == "compositional" else None,
                 top_k_fc2=config.primitive_config.top_k_fc2 if config.ffn_type == "compositional" else None,
-                activation=config.primitive_config.activation if config.ffn_type == "compositional" else "gelu",
+                activation=activation_str,
                 max_seq_len=config.max_seq_len,
                 temperature=config.primitive_config.temperature if config.ffn_type == "compositional" else 1.0,
                 forward_fast_mode=config.primitive_config.forward_fast_mode if config.ffn_type == "compositional" else "auto",
@@ -497,6 +513,7 @@ class PILONTransformer(nn.Module):
                 moe_config=moe_config,
                 enable_early_exit=config.enable_early_exit,
                 exit_threshold=config.exit_threshold,
+                use_subln=use_subln,
             )
             for i in range(config.n_layers)
         ])

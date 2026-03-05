@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Union, Tuple
 
-from .primitives import BandPrimitiveBanks, LayerCompositionWeights, ExpertCompositionBank
+from .primitives import BandPrimitiveBanks, LayerCompositionWeights, ExpertCompositionBank, _RMSNorm
 
 
 class StandardFFN(nn.Module):
@@ -47,6 +47,8 @@ class StandardFFN(nn.Module):
             self.activation = F.relu
         elif activation == "silu":
             self.activation = F.silu
+        elif activation == "squared_relu":
+            self.activation = lambda x: F.relu(x).square()
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
@@ -104,7 +106,8 @@ class CompositionalFFN(nn.Module):
         activation: str = "gelu",
         temperature: float = 1.0,
         forward_fast_mode: str = "auto",
-        forward_fast_min_topk: Optional[int] = None
+        forward_fast_min_topk: Optional[int] = None,
+        use_subln: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -153,8 +156,13 @@ class CompositionalFFN(nn.Module):
             self.activation = F.relu
         elif activation == "silu":
             self.activation = F.silu
+        elif activation == "squared_relu":
+            self.activation = lambda x: F.relu(x).square()
         else:
             raise ValueError(f"Unknown activation: {activation}")
+
+        # SubLN (ternary stability)
+        self.subln = _RMSNorm(d_model) if use_subln else None
 
     def update_topk_cache(self) -> None:
         """
@@ -497,6 +505,8 @@ class CompositionalFFN(nn.Module):
                 active_primitives=active_primitives
             )
 
+        if self.subln is not None:
+            out = self.subln(out)
         return out
 
     def get_entropy(self) -> Dict[str, float]:
@@ -644,7 +654,8 @@ class MoECompositionalFFN(nn.Module):
         dropout: float = 0.0,
         activation: str = "gelu",
         temperature: float = 1.0,
-        load_balancing: bool = True
+        load_balancing: bool = True,
+        use_subln: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -674,11 +685,20 @@ class MoECompositionalFFN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Activation
-        self.activation = {
+        _act_map = {
             "gelu": F.gelu,
             "relu": F.relu,
             "silu": F.silu,
-        }[activation]
+        }
+        if activation == "squared_relu":
+            self.activation = lambda x: F.relu(x).square()
+        elif activation in _act_map:
+            self.activation = _act_map[activation]
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
+
+        # SubLN (ternary stability)
+        self.subln = _RMSNorm(d_model) if use_subln else None
 
         # Cache for monitoring (set during forward)
         self._last_router_logits = None
@@ -782,6 +802,20 @@ class MoECompositionalFFN(nn.Module):
         flat_idx = expert_indices.reshape(-1)
         A_sel = bank.A.index_select(0, flat_idx).view(n_experts, top_k, bank.d_in, rank)
         B_sel = bank.B.index_select(0, flat_idx).view(n_experts, top_k, rank, bank.d_out)
+
+        # Ternary quantization for MoE (no-op when bank is not ternary).
+        # STE embeds scale factors in forward values, so no separate rescaling needed.
+        if getattr(bank, "ternary", False):
+            from .primitives import ternary_quantize, activation_quantize
+            A_flat = A_sel.reshape(-1, A_sel.shape[-2], A_sel.shape[-1])
+            B_flat = B_sel.reshape(-1, B_sel.shape[-2], B_sel.shape[-1])
+            A_flat_q, _ = ternary_quantize(A_flat)
+            B_flat_q, _ = ternary_quantize(B_flat)
+            A_sel = A_flat_q.view_as(A_sel)
+            B_sel = B_flat_q.view_as(B_sel)
+            x = bank.input_norm(x)
+            x_q, _, _ = activation_quantize(x, bank.activation_bits)
+            x = x_q
 
         # Convert per-expert top-k mixture into a single low-rank map
         if expert_top_weights is not None:
@@ -934,6 +968,16 @@ class MoECompositionalFFN(nn.Module):
         flat_idx = expert_indices.reshape(-1)
         A_sel = bank.A.index_select(0, flat_idx).view(n_experts, top_k, bank.d_in, rank)
         B_sel = bank.B.index_select(0, flat_idx).view(n_experts, top_k, rank, bank.d_out)
+
+        # Ternary quantization for weights (no-op when bank is not ternary)
+        if getattr(bank, "ternary", False):
+            from .primitives import ternary_quantize
+            A_flat = A_sel.reshape(-1, A_sel.shape[-2], A_sel.shape[-1])
+            B_flat = B_sel.reshape(-1, B_sel.shape[-2], B_sel.shape[-1])
+            A_flat_q, _ = ternary_quantize(A_flat)
+            B_flat_q, _ = ternary_quantize(B_flat)
+            A_sel = A_flat_q.view_as(A_sel)
+            B_sel = B_flat_q.view_as(B_sel)
 
         top_weights = expert_top_weights / (expert_top_weights.sum(dim=-1, keepdim=True) + 1e-8)
         sqrt_w = torch.sqrt(top_weights + 1e-8).to(dtype=A_sel.dtype)
@@ -1170,6 +1214,16 @@ class MoECompositionalFFN(nn.Module):
         else:
             # Dense expert execution across all experts.
             x_expert = x_flat.unsqueeze(0).expand(self.n_experts, -1, -1)  # (E, T, d_model)
+
+            # Ternary input quantization for dense path (no-op when bank is not ternary).
+            # STE embeds scale factors in forward values via _get_dense_fused_maps,
+            # so we only need to quantize the input here.
+            if getattr(fc1_bank, "ternary", False):
+                from .primitives import activation_quantize
+                x_expert = fc1_bank.input_norm(x_expert)
+                x_expert_q, _, _ = activation_quantize(x_expert, fc1_bank.activation_bits)
+                x_expert = x_expert_q
+
             fc1_A_cat, fc1_B_cat = self._get_dense_fused_maps(
                 fc1_bank,
                 fc1_idx,
@@ -1185,6 +1239,12 @@ class MoECompositionalFFN(nn.Module):
                 top_k=primitive_top_k,
             )
             h_all = self.activation(h_all)
+
+            if getattr(fc2_bank, "ternary", False):
+                from .primitives import activation_quantize
+                h_all = fc2_bank.input_norm(h_all)
+                h_all_q, _, _ = activation_quantize(h_all, fc2_bank.activation_bits)
+                h_all = h_all_q
 
             fc2_A_cat, fc2_B_cat = self._get_dense_fused_maps(
                 fc2_bank,
@@ -1206,6 +1266,8 @@ class MoECompositionalFFN(nn.Module):
 
         output = output_flat.view(batch_size, seq_len, self.d_model)
 
+        if self.subln is not None:
+            output = self.subln(output)
         output = self.dropout(output)
 
         # Compute auxiliary loss
@@ -1264,7 +1326,8 @@ def create_ffn(
     temperature: float = 1.0,
     forward_fast_mode: str = "auto",
     forward_fast_min_topk: Optional[int] = None,
-    moe_config: Optional[Any] = None  # MoEConfig from config.py
+    moe_config: Optional[Any] = None,  # MoEConfig from config.py
+    use_subln: bool = False,
 ) -> nn.Module:
     """
     Factory function to create FFN layer.
@@ -1312,7 +1375,8 @@ def create_ffn(
                 dropout=dropout,
                 activation=activation,
                 temperature=temperature,
-                load_balancing=moe_config.load_balancing
+                load_balancing=moe_config.load_balancing,
+                use_subln=use_subln,
             )
         else:
             # Phase A: Static composition
@@ -1329,7 +1393,8 @@ def create_ffn(
                 activation=activation,
                 temperature=temperature,
                 forward_fast_mode=forward_fast_mode,
-                forward_fast_min_topk=forward_fast_min_topk
+                forward_fast_min_topk=forward_fast_min_topk,
+                use_subln=use_subln,
             )
     else:
         raise ValueError(f"Unknown ffn_type: {ffn_type}")

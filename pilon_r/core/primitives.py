@@ -16,6 +16,109 @@ from typing import Dict, List, Optional, Tuple
 import math
 
 
+# ---------------------------------------------------------------------------
+# Ternary quantization helpers (BitNet b1.58)
+# ---------------------------------------------------------------------------
+
+class _RMSNorm(nn.Module):
+    """Minimal RMSNorm (avoids circular import with model.py)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Stay in native dtype (fp16/bf16) — avoids expensive full-tensor fp32 copy.
+        # Fuse two muls into one: x * (rms_inv * weight) saves a kernel launch.
+        rms_inv = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
+        return x * (rms_inv * self.weight)
+
+
+class _TernaryWeightSTE(torch.autograd.Function):
+    """Quantize weights to {-1, 0, +1} in a single autograd node.
+
+    Forward: compute ternary weights scaled by absmean.
+    Backward: STE — pass gradients straight through to shadow weights.
+
+    All computation uses tensor ops (no .item()) so torch.compile can
+    fuse them into a single kernel.
+    """
+
+    @staticmethod
+    def forward(ctx, w, scale):
+        s = scale.to(dtype=w.dtype)
+        w_ternary = (w / s).round().clamp(-1, 1)
+        return w_ternary * s
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None  # STE for w, None for scale
+
+
+class _ActivationSTE(torch.autograd.Function):
+    """Quantize activations in a single autograd node.
+
+    Forward: quantize to [-Qb, Qb] range, rescale back to original range.
+    Backward: STE — pass gradients straight through.
+
+    All computation uses tensor ops (no .item()) so torch.compile can
+    fuse them into a single kernel.
+    """
+
+    @staticmethod
+    def forward(ctx, x, scale, Qb):
+        s = scale.to(dtype=x.dtype)
+        x_quant = (x * (Qb / s)).round().clamp(-Qb, Qb)
+        return x_quant * (s / Qb)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None  # STE for x, None for scale/Qb
+
+
+def ternary_quantize(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize weights to {-1, 0, +1} using absmean scaling + STE.
+
+    Uses a custom autograd Function to collapse quantization into a single
+    autograd node, reducing memory from ~7-8 intermediate tensors to 1.
+
+    Scale is computed in native dtype (fp16 mean is sufficient for absmean),
+    then stored as fp32 for the return value.
+
+    Returns:
+        (w_ternary_ste, scale) where scale is the absmean in fp32.
+        During backward, gradients flow through w unchanged (straight-through).
+    """
+    with torch.no_grad():
+        scale = w.abs().mean().float().clamp(min=1e-8)
+    w_ste = _TernaryWeightSTE.apply(w, scale)
+    return w_ste, scale
+
+
+def activation_quantize(x: torch.Tensor, bits: int = 8) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    Quantize activations to `bits`-bit using absmax scaling + STE.
+
+    Uses a custom autograd Function to collapse the round+clamp+rescale
+    into a single autograd node.
+
+    Scale is computed in native dtype to avoid full-tensor float32 conversion.
+
+    Returns:
+        (x_quant_ste, scale, Qb) where Qb = 2^(bits-1).
+        During backward, gradients flow through x unchanged.
+    """
+    if bits <= 0:
+        return x, torch.ones(1, device=x.device, dtype=torch.float32), 1.0
+    Qb = 2 ** (bits - 1)
+    with torch.no_grad():
+        scale = x.abs().amax().float().clamp(min=1e-8)
+    x_ste = _ActivationSTE.apply(x, scale, Qb)
+    return x_ste, scale, Qb
+
+
 class LowRankPrimitive(nn.Module):
     """
     A single low-rank primitive: W = A @ B
@@ -70,7 +173,9 @@ class PrimitiveBank(nn.Module):
         d_out: int,
         n_primitives: int,
         rank: int,
-        name: str = "bank"
+        name: str = "bank",
+        ternary: bool = False,
+        activation_bits: int = 8,
     ):
         super().__init__()
         self.d_in = d_in
@@ -78,6 +183,8 @@ class PrimitiveBank(nn.Module):
         self.n_primitives = n_primitives
         self.rank = rank
         self.name = name
+        self.ternary = ternary
+        self.activation_bits = activation_bits
 
         # Packed tensors for vectorized computation
         # Using Kaiming-like initialization adapted for low-rank
@@ -99,6 +206,112 @@ class PrimitiveBank(nn.Module):
         # Latent affine transform in rank space (shared across primitives)
         self.latent_scale = nn.Parameter(torch.ones(rank))
         self.latent_bias = nn.Parameter(torch.zeros(rank))
+
+        # Ternary quantization support
+        if ternary:
+            self.input_norm = _RMSNorm(d_in)
+
+        # Ternary weight cache: pre-quantize all primitives once per
+        # optimizer step, then index_select from cached quantized tensors.
+        # This avoids redundant quantization across micro-batches and layers.
+        self._A_q_cache: Optional[torch.Tensor] = None
+        self._B_q_cache: Optional[torch.Tensor] = None
+        self._q_cache_valid: bool = False
+
+    # ------------------------------------------------------------------
+    # Ternary weight cache management
+    # ------------------------------------------------------------------
+
+    def prepare_q_cache(self) -> None:
+        """Pre-quantize all primitives with autograd. Call once per step.
+
+        The cached tensors are part of the autograd graph so gradients
+        from all micro-batches accumulate correctly through the STE.
+        """
+        if not self.ternary:
+            return
+        self._A_q_cache, _ = ternary_quantize(self.A)
+        self._B_q_cache, _ = ternary_quantize(self.B)
+        self._q_cache_valid = True
+
+    def invalidate_q_cache(self) -> None:
+        """Invalidate cache. Call after optimizer.step()."""
+        self._A_q_cache = None
+        self._B_q_cache = None
+        self._q_cache_valid = False
+
+    # ------------------------------------------------------------------
+    # Ternary quantization helpers (no-ops when self.ternary is False)
+    # ------------------------------------------------------------------
+
+    def _quantize_weights(
+        self, A: torch.Tensor, B: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize A and B to ternary. No-op when ternary=False."""
+        if not self.ternary:
+            z = torch.ones(1, device=A.device, dtype=torch.float32)
+            return A, B, z, z
+        A_q, scale_A = ternary_quantize(A)
+        B_q, scale_B = ternary_quantize(B)
+        return A_q, B_q, scale_A, scale_B
+
+    def _quantize_weights_or_cache(
+        self, top_indices: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get quantized weights, using cache if available.
+
+        If the full-bank cache is valid, index_select from it (cheap).
+        Otherwise, fall back to quantizing the selected primitives.
+        """
+        z = torch.ones(1, device=self.A.device, dtype=torch.float32)
+        if not self.ternary:
+            A_sel = self.A.index_select(0, top_indices)
+            B_sel = self.B.index_select(0, top_indices)
+            return A_sel, B_sel, z, z
+        if self._q_cache_valid and self._A_q_cache is not None:
+            A_sel = self._A_q_cache.index_select(0, top_indices)
+            B_sel = self._B_q_cache.index_select(0, top_indices)
+            return A_sel, B_sel, z, z
+        # Fallback: gather then quantize
+        A_sel = self.A.index_select(0, top_indices)
+        B_sel = self.B.index_select(0, top_indices)
+        A_q, scale_A = ternary_quantize(A_sel)
+        B_q, scale_B = ternary_quantize(B_sel)
+        return A_q, B_q, scale_A, scale_B
+
+    def _quantize_input(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Apply input_norm + activation quantization. No-op when ternary=False."""
+        if not self.ternary:
+            return x, torch.ones(1, device=x.device, dtype=torch.float32), 1.0
+        x = self.input_norm(x)
+        x_q, scale_x, Qb = activation_quantize(x, self.activation_bits)
+        return x_q, scale_x, Qb
+
+    def _rescale_output(
+        self,
+        output: torch.Tensor,
+        scale_A: torch.Tensor,
+        scale_B: torch.Tensor,
+        scale_x: torch.Tensor,
+        Qb: float,
+    ) -> torch.Tensor:
+        """No-op: STE already embeds scale factors in forward values."""
+        return output
+
+    def quantize_external(
+        self, A: torch.Tensor, B: torch.Tensor, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """
+        Public API for MoE code that accesses bank.A/B directly.
+
+        Returns:
+            (A_q, B_q, x_q, scale_A, scale_B, scale_x, Qb)
+        """
+        A_q, B_q, scale_A, scale_B = self._quantize_weights(A, B)
+        x_q, scale_x, Qb = self._quantize_input(x)
+        return A_q, B_q, x_q, scale_A, scale_B, scale_x, Qb
 
     def forward(
         self,
@@ -148,6 +361,10 @@ class PrimitiveBank(nn.Module):
             B = B.index_select(0, top_indices)
             weights = top_weights
 
+        # Ternary quantization (no-op when ternary=False)
+        A, B, scale_A, scale_B = self._quantize_weights(A, B)
+        x, scale_x, Qb = self._quantize_input(x)
+
         batch, seq, _ = x.shape
         x_flat = x.reshape(-1, self.d_in)
 
@@ -160,6 +377,7 @@ class PrimitiveBank(nn.Module):
         U.add_(bias)
         out_flat = torch.einsum("tpr,pro,p->to", U, B, weights)  # [T, d_out]
 
+        out_flat = self._rescale_output(out_flat, scale_A, scale_B, scale_x, Qb)
         return out_flat.view(batch, seq, self.d_out)
 
     def select_topk_primitives(
@@ -227,7 +445,7 @@ class PrimitiveBank(nn.Module):
             top_weights, top_indices = torch.topk(weights, top_k, sorted=False)
         else:
             top_weights = weights.index_select(0, top_indices)
-        top_weights = top_weights.float()
+        # Normalize weights in native dtype (avoid float32 round-trip)
         top_weights = top_weights / (top_weights.sum() + 1e-8)
 
         # Gather top-k primitives (or reuse preselected factors when provided).
@@ -239,12 +457,21 @@ class PrimitiveBank(nn.Module):
             if top_weights.numel() != top_k:
                 top_weights = top_weights[:top_k]
                 top_weights = top_weights / (top_weights.sum() + 1e-8)
+            # Quantize preselected (can't use bank cache for these)
+            A_sel, B_sel, scale_A, scale_B = self._quantize_weights(A_sel, B_sel)
         else:
-            A_sel = A.index_select(0, top_indices)  # (k, d_in, r)
-            B_sel = B.index_select(0, top_indices)  # (k, r, d_out)
+            # Use pre-quantized cache if available (index_select is cheap)
+            A_sel, B_sel, scale_A, scale_B = self._quantize_weights_or_cache(top_indices)
+            # Apply rank scheduling to selected primitives
+            if active_rank is not None:
+                A_sel = A_sel[:, :, :active_rank]
+                B_sel = B_sel[:, :active_rank, :]
+
+        x, scale_x, Qb = self._quantize_input(x)
 
         # Scale each primitive by sqrt(weight) and concatenate into a single low-rank map
-        sqrt_w = torch.sqrt(top_weights + 1e-8).to(dtype=A_sel.dtype)
+        # Stay in native dtype — sqrt of small positive weights is numerically fine in fp16
+        sqrt_w = torch.sqrt(top_weights.to(dtype=A_sel.dtype) + 1e-8)
         A_sel = A_sel * sqrt_w[:, None, None]
         B_sel = B_sel * sqrt_w[:, None, None]
 
@@ -266,6 +493,7 @@ class PrimitiveBank(nn.Module):
         U = U.view(-1, top_k * rank)
 
         out_flat = U @ B_cat  # (T, d_out)
+        out_flat = self._rescale_output(out_flat, scale_A, scale_B, scale_x, Qb)
         return out_flat.view(batch, seq, self.d_out)
 
     def forward_sparse(
@@ -311,9 +539,9 @@ class PrimitiveBank(nn.Module):
             top_k = top_indices.numel()
         top_weights = top_weights / (top_weights.sum() + 1e-8)
 
-        # Only gather the selected primitives
-        A_sel = A.index_select(0, top_indices)  # (k, d_in, r)
-        B_sel = B.index_select(0, top_indices)  # (k, r, d_out)
+        # Only gather the selected primitives (use cache if available)
+        A_sel, B_sel, scale_A, scale_B = self._quantize_weights_or_cache(top_indices)
+        x, scale_x, Qb = self._quantize_input(x)
 
         batch, seq, _ = x.shape
         x_flat = x.reshape(-1, self.d_in)
@@ -328,6 +556,7 @@ class PrimitiveBank(nn.Module):
 
         Y = torch.einsum("tkr,kro->tko", U, B_sel)  # (T, k, d_out)
         out_flat = torch.einsum("tko,k->to", Y, top_weights.to(dtype=Y.dtype))
+        out_flat = self._rescale_output(out_flat, scale_A, scale_B, scale_x, Qb)
         return out_flat.view(batch, seq, self.d_out)
 
     def forward_fast(
@@ -393,15 +622,6 @@ class PrimitiveBank(nn.Module):
         This is slower but easier to verify correctness.
         """
         batch, seq, _ = x.shape
-        out = torch.zeros(batch, seq, self.d_out, device=x.device, dtype=x.dtype)
-
-        n_primitives = weights.numel()
-        if top_k is not None and top_k < n_primitives:
-            top_weights, top_indices = torch.topk(weights, top_k, sorted=False)
-            top_weights = top_weights / (top_weights.sum() + 1e-8)
-        else:
-            top_indices = torch.arange(self.n_primitives, device=x.device)
-            top_weights = weights
 
         A = self.A[:, :, :active_rank] if active_rank is not None else self.A
         B = self.B[:, :active_rank, :] if active_rank is not None else self.B
@@ -420,16 +640,29 @@ class PrimitiveBank(nn.Module):
             if top_k is not None:
                 top_k = min(top_k, active_primitives)
 
+        n_primitives = A.size(0)
+        if top_k is not None and top_k < n_primitives:
+            top_weights, top_indices = torch.topk(weights, top_k, sorted=False)
+            top_weights = top_weights / (top_weights.sum() + 1e-8)
+        else:
+            top_indices = torch.arange(n_primitives, device=x.device)
+            top_weights = weights
+
+        # Ternary quantization (no-op when ternary=False)
+        A, B, scale_A, scale_B = self._quantize_weights(A, B)
+        x, scale_x, Qb = self._quantize_input(x)
+        out = torch.zeros(batch, seq, self.d_out, device=x.device, dtype=x.dtype)
+
         for i, idx in enumerate(top_indices):
             A_i = A[idx]  # [d_in, r]
             B_i = B[idx]  # [r, d_out]
             w_i = top_weights[i]
             latent = x @ A_i
-            latent.mul_(scale)
-            latent.add_(bias)
+            latent = latent * scale + bias
             prim_out = latent @ B_i  # [batch, seq, d_out]
             out = out + w_i * prim_out
 
+        out = self._rescale_output(out, scale_A, scale_B, scale_x, Qb)
         return out
 
     def compute_all_outputs(
@@ -449,7 +682,6 @@ class PrimitiveBank(nn.Module):
             Tensor of shape (batch, seq, n_primitives, d_out)
         """
         batch, seq, _ = x.shape
-        x_flat = x.reshape(-1, self.d_in)
 
         # Support rank scheduling
         A = self.A[:, :, :active_rank] if active_rank is not None else self.A
@@ -467,6 +699,11 @@ class PrimitiveBank(nn.Module):
             A = A[:active_primitives]
             B = B[:active_primitives]
 
+        # Ternary quantization (no-op when ternary=False)
+        A, B, scale_A, scale_B = self._quantize_weights(A, B)
+        x, scale_x, Qb = self._quantize_input(x)
+        x_flat = x.reshape(-1, self.d_in)
+
         U = torch.einsum("td,pdr->tpr", x_flat, A)  # [T, P, r]
         if scale.dtype != U.dtype:
             scale = scale.to(dtype=U.dtype)
@@ -475,6 +712,7 @@ class PrimitiveBank(nn.Module):
         U.add_(bias)
         Y = torch.einsum("tpr,pro->tpo", U, B)  # [T, P, d_out]
 
+        Y = self._rescale_output(Y, scale_A, scale_B, scale_x, Qb)
         n_primitives = A.size(0)
         return Y.view(batch, seq, n_primitives, self.d_out)
 
@@ -537,6 +775,8 @@ class BandPrimitiveBanks(nn.Module):
         share_fc1_fc2: bool = False,  # Should be False for Phase A
         n_hot: Optional[int] = None,  # Phase B.5b: tiered primitive loading
         swap_interval: int = 100,     # Steps between hot/warm swaps
+        ternary: bool = False,        # Ternary weight quantization
+        activation_bits: int = 8,     # Activation quantization bitwidth
     ):
         super().__init__()
         self.d_model = d_model
@@ -546,6 +786,8 @@ class BandPrimitiveBanks(nn.Module):
         self.bands = bands
         self.share_fc1_fc2 = share_fc1_fc2
         self.n_hot = n_hot
+        self.ternary = ternary
+        self.activation_bits = activation_bits
 
         # Create layer -> band mapping
         self.layer_to_band: Dict[int, str] = {}
@@ -555,6 +797,11 @@ class BandPrimitiveBanks(nn.Module):
 
         # Determine whether to use tiered banks
         use_tiered = (n_hot is not None and n_hot < n_primitives)
+        if use_tiered and ternary:
+            raise NotImplementedError(
+                "Ternary quantization is not yet supported with tiered primitive banks. "
+                "Disable tiering (remove --n-hot) or disable ternary (remove --ternary)."
+            )
 
         # Create banks for each band
         # fc1: d_model -> d_ff (expansion)
@@ -583,7 +830,9 @@ class BandPrimitiveBanks(nn.Module):
                     d_out=d_ff,
                     n_primitives=n_primitives,
                     rank=rank,
-                    name=f"{band_name}_fc1"
+                    name=f"{band_name}_fc1",
+                    ternary=ternary,
+                    activation_bits=activation_bits,
                 )
 
             if share_fc1_fc2:
@@ -612,7 +861,9 @@ class BandPrimitiveBanks(nn.Module):
                         d_out=d_model,
                         n_primitives=n_primitives,
                         rank=rank,
-                        name=f"{band_name}_fc2"
+                        name=f"{band_name}_fc2",
+                        ternary=ternary,
+                        activation_bits=activation_bits,
                     )
 
     def get_fc1_bank(self, layer_idx: int) -> PrimitiveBank:

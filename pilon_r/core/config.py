@@ -91,6 +91,12 @@ class PrimitiveConfig:
     # Steps between hot/warm primitive swaps
     swap_interval: int = 100
 
+    # Ternary quantization (BitNet b1.58)
+    ternary_primitives: bool = False     # Enable ternary weight quantization
+    activation_bits: int = 8             # Activation quantization bitwidth (0 = disable)
+    use_subln: bool = False              # SubLN normalization for ternary stability
+    use_squared_relu: bool = False       # Squared ReLU activation (sparser, pairs with ternary)
+
 
 @dataclass
 class ModelConfig:
