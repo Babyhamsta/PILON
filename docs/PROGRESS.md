@@ -179,7 +179,7 @@ Consistent gap on complex data. Learning, but slower.
 
 **Final Results (January 31, 2026):**
 - Training: 97K steps, ~90.9B tokens processed
-- Throughput: ~200k tokens/second (massive improvement)
+- Throughput: ~87k tok/s compiled, ~42k tok/s eager (up from ~14k)
 - Convergence gap: reduced from 1.5x to ~1.13x (validated in 500M-token crossover: fp16 val_loss=4.6896 vs dense 4.1654)
 - Model size: 48.1M parameters
 
@@ -189,7 +189,7 @@ PILON was ~2x slower than dense baseline despite similar parameter counts.
 
 | Model | Throughput (Before) | Throughput (After) |
 |-------|:-:|:-:|
-| PILON | ~14k tok/s | ~200k tok/s |
+| PILON | ~14k tok/s | ~87k tok/s (compiled), ~42k tok/s (eager) |
 | Dense | ~29k tok/s | — |
 
 Root causes: inefficient compute path (recomputing work each call), top-k selection overhead, no caching, dense FFN training applied to non-dense architecture.
@@ -396,7 +396,7 @@ torch.compile closes the eager gap (1.88x) almost entirely (1.10x compiled).
 
 - [x] Phase 0: Representation viability proven
 - [x] Phase A: Training from scratch works
-- [x] Phase B: Optimization & throughput (97K steps, ~200k tok/s, 1.13x gap validated)
+- [x] Phase B: Optimization & throughput (97K steps, ~87k compiled / ~42k eager tok/s, 1.13x gap)
 - [x] SFT fine-tuning (1 epoch on OpenHermes-2.5)
 - [x] Phase B.5a: Compute path fix (forward_sparse)
 - [x] Phase B.5b: TieredPrimitiveBank (hot/warm VRAM tiering)
@@ -427,7 +427,7 @@ torch.compile closes the eager gap (1.88x) almost entirely (1.10x compiled).
 | Jan 13 | Staged training | Exploits primitive/composition split |
 | Jan 13 | Separate param groups | Different components need different LRs |
 | Jan 13 | Rank scheduling | PILON-specific optimization lever |
-| Jan 31 | Phase B sparse training complete | 97K steps, 200k tok/s |
+| Jan 31 | Phase B sparse training complete | 97K steps, ~42k tok/s eager |
 | Jan 31 | SFT validation complete | 1 epoch, decent output quality |
 | Feb 23 | Phase B.5 structural advantages complete | Tiered banks, early exit, compute path fix |
 | Mar 5 | Ternary quantization complete | 1.10x loss ratio, healthy training metrics |
@@ -438,7 +438,7 @@ torch.compile closes the eager gap (1.88x) almost entirely (1.10x compiled).
 
 ### Resolved
 
-1. **Will compute fixes close the throughput gap?** — Yes: ~200k tok/s (from 14k)
+1. **Will compute fixes close the throughput gap?** — Yes: ~87k compiled / ~42k eager tok/s (from 14k)
 2. **Will staged training close the convergence gap?** — Yes: 1.13x (from 1.5x), validated on 500M tokens
 3. **Is the gap ceiling or convergence?** — Convergence (loss still improving at run end)
 4. **Does ternary quantization work with PILON?** — Yes: 1.10x loss ratio, stable training

@@ -333,7 +333,7 @@ python -m pilon_r.train --model-size 360m --ffn-type compositional \
 **1B tokens at 360M on a 4070:**
 - Effective batch = 4 × 16 = 64 sequences × 2048 tokens = 131K tokens/step
 - 1B tokens ÷ 131K = ~7,630 steps
-- At ~200k tok/s (Phase B measured): ~5,000 seconds ≈ 1.4 hours per model
+- At ~87k tok/s (compiled, RTX 4070): ~11,500 seconds ≈ 3.2 hours per model
 - Total for 4 configs: ~6 hours
 
 **What we measure:**

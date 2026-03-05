@@ -349,7 +349,7 @@ flowchart LR
 |-------|:------:|---------|
 | Phase 0: Representation Viability | :white_check_mark: | Low-rank primitives can represent FFN structure |
 | Phase A: Training From Scratch | :white_check_mark: | Stable training, learns language, no collapse |
-| Phase B: Optimization & Throughput | :white_check_mark: | ~200k tok/s, 1.13x convergence gap |
+| Phase B: Optimization & Throughput | :white_check_mark: | ~87k tok/s compiled, 1.13x convergence gap |
 | Phase B.5: Structural Advantages | :white_check_mark: | Tiered banks, early exit, sparse compute path |
 | Ternary Quantization (BitNet b1.58) | :white_check_mark: | {-1,0,1} weights, 1.10x compiled throughput ratio |
 | Phase C: SSM/MLA Integration | :hourglass: | Long context, memory efficiency |
