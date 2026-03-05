@@ -36,9 +36,9 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Bank["Shared Primitive Bank (per band)\nP0: A0 @ B0 | P1: A1 @ B1 | ... | P47: A47 @ B47\neach primitive is low-rank: (d_in, r) @ (r, d_out)"]
+    Bank["Shared Primitive Bank (per band)<br>P0: A0 @ B0 | P1: A1 @ B1 | ... | P47: A47 @ B47<br>each primitive is low-rank: (d_in, r) @ (r, d_out)"]
     TopK["Top-k Selection (k=8 of 48)"]
-    Fuse["Fused Forward\n1. Gather k primitives\n2. Concatenate into single low-rank map\n3. Two GEMMs: x @ A_cat, U @ B_cat\n4. Weighted sum via sqrt(w)"]
+    Fuse["Fused Forward<br>1. Gather k primitives<br>2. Concatenate into single low-rank map<br>3. Two GEMMs: x @ A_cat, U @ B_cat<br>4. Weighted sum via sqrt(w)"]
     Out["output"]
 
     Bank --> TopK --> Fuse --> Out
@@ -64,9 +64,9 @@ flowchart LR
         L6["Layer 6"] & L7["Layer 7"]
     end
 
-    BE["Primitive Bank\n(early)"] --> L0 & L1 & L2
-    BM["Primitive Bank\n(middle)"] --> L3 & L4 & L5
-    BL["Primitive Bank\n(late)"] --> L6 & L7
+    BE["Primitive Bank<br>(early)"] --> L0 & L1 & L2
+    BM["Primitive Bank<br>(middle)"] --> L3 & L4 & L5
+    BL["Primitive Bank<br>(late)"] --> L6 & L7
 
     style BE fill:#2ecc71,color:#fff
     style BM fill:#f39c12,color:#fff
@@ -329,13 +329,13 @@ Training runs write to `outputs/` by default. Each run saves:
 
 ```mermaid
 flowchart LR
-    P0["Phase 0\nRepresentation\nViability"]
-    PA["Phase A\nTraining From\nScratch"]
-    PB["Phase B\nOptimization &\nThroughput"]
-    PB5["Phase B.5\nStructural\nAdvantages"]
-    TQ["Ternary\nQuantization"]
-    PC["Phase C\nSSM / MLA"]
-    PD["Phase D\nReasoning"]
+    P0["Phase 0<br>Representation<br>Viability"]
+    PA["Phase A<br>Training From<br>Scratch"]
+    PB["Phase B<br>Optimization &<br>Throughput"]
+    PB5["Phase B.5<br>Structural<br>Advantages"]
+    TQ["Ternary<br>Quantization"]
+    PC["Phase C<br>SSM / MLA"]
+    PD["Phase D<br>Reasoning"]
 
     P0 --> PA --> PB --> PB5 --> TQ --> PC --> PD
 
