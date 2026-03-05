@@ -73,19 +73,23 @@ n_primitives=80, rank=80, top_k=8
 
 ## Results
 
-### Training Stability and Quality (48M)
+### Training Quality (48M, 500M tokens, FineWeb-Edu)
 
-| Model | Training | vs Dense Baseline |
-|-------|----------|-------------------|
-| Dense-48M (baseline) | - | 1.00x |
-| PILON-48M (fp16, 97K steps) | Stable | ~1.22x |
-| PILON-48M (ternary + SubLN + SqReLU) | *Pending* | *Pending* |
+All runs trained to 15,255 steps on identical data with batch=8, grad_accum=8, seq_len=512.
 
-- The ~1.22x gap was measured after extended training (97K steps, ~90.9B tokens processed)
-- Training is fully stable: no NaN, no divergence, no primitive collapse
-- Primitive entropy stays healthy (~3.4+) throughout training
+| Model | Final Val Loss | Val PPL | vs Dense |
+|-------|---------------|---------|----------|
+| Dense-48M | 4.1654 | 64.42 | 1.00x |
+| PILON-48M Ternary + SubLN + SqReLU | 4.5958 | 99.07 | 1.10x |
+| PILON-48M Ternary + SubLN | 4.6473 | 104.30 | 1.12x |
+| PILON-48M fp16 (incomplete) | — | — | ~1.22x* |
+
+*\*fp16 PILON 1.22x gap from earlier extended run (97K steps, ~90.9B tokens). The 500M-token fp16 crossover run did not complete.*
+
+- Training is fully stable across all configs: no NaN, no divergence, no primitive collapse
+- Primitive entropy stays healthy throughout (~2.5+ at end of ternary runs)
+- Squared ReLU variant slightly outperforms plain ternary (99 vs 104 PPL)
 - The gap is convergence speed, not a ceiling — loss continues improving with more tokens
-- Ternary crossover experiments are configured but not yet run
 
 ### Throughput (RTX 4070, batch=8, seq=512, fwd+bwd)
 
