@@ -352,6 +352,12 @@ flowchart LR
 
 ---
 
+## AI Disclosure
+
+This project was developed with assistance from AI tools, including [Claude Code](https://claude.ai) (Anthropic) and [Codex](https://openai.com/codex) (OpenAI). AI was used to help with implementation, debugging, profiling, and research iteration. All architectural decisions, experiment design, and result interpretation were human-directed.
+
+---
+
 ## License
 
 MIT License (see [`LICENSE`](LICENSE)).
