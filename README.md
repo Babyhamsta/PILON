@@ -73,17 +73,19 @@ n_primitives=80, rank=80, top_k=8
 
 ## Results
 
-### Training Stability and Quality (48M, 500M tokens)
+### Training Stability and Quality (48M)
 
-| Model | Final Val Loss | vs Dense Baseline |
-|-------|---------------|-------------------|
-| Dense-48M (baseline) | ~3.8 | 1.00x |
-| PILON-48M (fp16) | ~4.1 | ~1.08x |
-| PILON-48M (ternary + SubLN + SqReLU) | ~4.2 | ~1.10x |
+| Model | Training | vs Dense Baseline |
+|-------|----------|-------------------|
+| Dense-48M (baseline) | - | 1.00x |
+| PILON-48M (fp16, 97K steps) | Stable | ~1.22x |
+| PILON-48M (ternary + SubLN + SqReLU) | *Pending* | *Pending* |
 
+- The ~1.22x gap was measured after extended training (97K steps, ~90.9B tokens processed)
 - Training is fully stable: no NaN, no divergence, no primitive collapse
 - Primitive entropy stays healthy (~3.4+) throughout training
 - The gap is convergence speed, not a ceiling — loss continues improving with more tokens
+- Ternary crossover experiments are configured but not yet run
 
 ### Throughput (RTX 4070, batch=8, seq=512, fwd+bwd)
 
