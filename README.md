@@ -6,42 +6,72 @@ PILON-R replaces dense FFN weight matrices in transformers with shared low-rank 
 
 The result: competitive language modeling quality at a fraction of the FFN parameter cost, with structural knobs (rank scheduling, progressive unfreezing, tiered VRAM loading, early exit) that dense FFNs simply cannot offer.
 
+---
+
 ## How It Works
 
 ### Dense FFN (standard transformer)
-```
-x -> [d_model x d_ff] -> activation -> [d_ff x d_model] -> out
-       ^                                  ^
-       Two full dense matrices per layer (millions of params each)
+
+```mermaid
+flowchart LR
+    X["x (d_model)"] --> FC1["FC1: d_model x d_ff"]
+    FC1 --> Act["Activation"]
+    Act --> FC2["FC2: d_ff x d_model"]
+    FC2 --> Out["output"]
+    style FC1 fill:#e74c3c,color:#fff
+    style FC2 fill:#e74c3c,color:#fff
 ```
 
+> Two full dense matrices per layer — millions of parameters each, no sharing.
+
 ### PILON Compositional FFN
-```
-                    Shared Primitive Bank (per band)
-                    ┌─────────────────────────────┐
-                    │  P0: A0 (d_in, r) @ B0 (r, d_out)  │
-                    │  P1: A1 (d_in, r) @ B1 (r, d_out)  │
-                    │  ...                                 │
-                    │  P47: A47 (d_in, r) @ B47 (r, d_out)│
-                    └─────────────────────────────┘
-                                 |
-                        Top-k selection (k=8)
-                                 |
-                    ┌─────────────────────────────┐
-                    │  Gather 8 primitives          │
-                    │  Concatenate into fused map   │
-                    │  2 GEMMs (x @ A_cat, U @ B_cat) │
-                    │  Weighted sum via sqrt(w)      │
-                    └─────────────────────────────┘
-                                 |
-                              output
+
+```mermaid
+flowchart TD
+    Bank["Shared Primitive Bank (per band)\nP0: A0 @ B0 | P1: A1 @ B1 | ... | P47: A47 @ B47\neach primitive is low-rank: (d_in, r) @ (r, d_out)"]
+    TopK["Top-k Selection (k=8 of 48)"]
+    Fuse["Fused Forward\n1. Gather k primitives\n2. Concatenate into single low-rank map\n3. Two GEMMs: x @ A_cat, U @ B_cat\n4. Weighted sum via sqrt(w)"]
+    Out["output"]
+
+    Bank --> TopK --> Fuse --> Out
+
+    style Bank fill:#2ecc71,color:#fff
+    style TopK fill:#3498db,color:#fff
+    style Fuse fill:#9b59b6,color:#fff
 ```
 
 Layers within a **band** (e.g., layers 0-2 = "early") share the same primitive bank but learn independent composition weights. This means early layers can share low-level feature extractors while late layers share task-specific transforms.
 
+### Band Sharing Structure
+
+```mermaid
+flowchart LR
+    subgraph Early Band
+        L0["Layer 0"] & L1["Layer 1"] & L2["Layer 2"]
+    end
+    subgraph Middle Band
+        L3["Layer 3"] & L4["Layer 4"] & L5["Layer 5"]
+    end
+    subgraph Late Band
+        L6["Layer 6"] & L7["Layer 7"]
+    end
+
+    BE["Primitive Bank\n(early)"] --> L0 & L1 & L2
+    BM["Primitive Bank\n(middle)"] --> L3 & L4 & L5
+    BL["Primitive Bank\n(late)"] --> L6 & L7
+
+    style BE fill:#2ecc71,color:#fff
+    style BM fill:#f39c12,color:#fff
+    style BL fill:#e74c3c,color:#fff
+```
+
 ### Ternary Quantization (BitNet b1.58)
 
-Primitive weights can be constrained to `{-1, 0, +1}` using absmean scaling with straight-through estimation (STE). Combined with 8-bit activation quantization and SubLN normalization, this produces extremely compact models with minimal quality loss.
+Primitive weights can be constrained to $\{-1, 0, +1\}$ using absmean scaling with straight-through estimation (STE). Combined with 8-bit activation quantization and SubLN normalization, this produces extremely compact models with minimal quality loss.
+
+$$w_{\text{ternary}} = \text{sign}\!\left(\text{round}\!\left(\frac{w}{\alpha}\right)\right) \cdot \alpha, \quad \alpha = \text{mean}(|w|)$$
+
+---
 
 ## Architecture Overview
 
@@ -55,21 +85,24 @@ Primitive weights can be constrained to `{-1, 0, +1}` using absmean scaling with
 | **TieredPrimitiveBank** | VRAM-efficient: only `n_hot` primitives in GPU memory, rest in CPU pinned memory |
 | **ExitGate** | Per-layer gate that skips FFN computation for "easy" tokens during inference |
 
+---
+
 ## Model Configurations
 
-### 48M (Development / Ablation)
-```
-d_model=512, n_layers=8, n_heads=8, d_ff=2048
-n_primitives=48, rank=48, top_k=8
-3 bands: early(0-2), middle(3-5), late(6-7)
-```
+<table>
+<tr><th></th><th>48M (Dev / Ablation)</th><th>360M (Scale Validation)</th></tr>
+<tr><td><b>d_model</b></td><td>512</td><td>1024</td></tr>
+<tr><td><b>n_layers</b></td><td>8</td><td>24</td></tr>
+<tr><td><b>n_heads</b></td><td>8</td><td>16</td></tr>
+<tr><td><b>d_ff</b></td><td>2048</td><td>4096</td></tr>
+<tr><td><b>n_primitives</b></td><td>48</td><td>80</td></tr>
+<tr><td><b>rank</b></td><td>48</td><td>80</td></tr>
+<tr><td><b>top_k</b></td><td>8</td><td>8</td></tr>
+<tr><td><b>bands</b></td><td>early(0-2), middle(3-5), late(6-7)</td><td>early(0-7), middle(8-15), late(16-23)</td></tr>
+<tr><td><b>max_seq_len</b></td><td>512</td><td>2048</td></tr>
+</table>
 
-### 360M (Scale Validation)
-```
-d_model=1024, n_layers=24, n_heads=16, d_ff=4096
-n_primitives=80, rank=80, top_k=8
-3 bands: early(0-7), middle(8-15), late(16-23)
-```
+---
 
 ## Results
 
@@ -78,13 +111,14 @@ n_primitives=80, rank=80, top_k=8
 All runs trained to 15,255 steps on identical data with batch=8, grad_accum=8, seq_len=512.
 
 | Model | Final Val Loss | Val PPL | vs Dense |
-|-------|---------------|---------|----------|
+|-------|:-------------:|:-------:|:--------:|
 | Dense-48M | 4.1654 | 64.42 | 1.00x |
-| PILON-48M Ternary + SubLN + SqReLU | 4.5958 | 99.07 | 1.10x |
+| PILON-48M Ternary + SubLN + SqReLU | 4.5958 | 99.07 | **1.10x** |
 | PILON-48M Ternary + SubLN | 4.6473 | 104.30 | 1.12x |
-| PILON-48M fp16 (incomplete) | — | — | ~1.22x* |
+| PILON-48M fp16 (incomplete) | --- | --- | ~1.22x* |
 
-*\*fp16 PILON 1.22x gap from earlier extended run (97K steps, ~90.9B tokens). The 500M-token fp16 crossover run did not complete.*
+> [!NOTE]
+> *fp16 PILON 1.22x gap from earlier extended run (97K steps, ~90.9B tokens). The 500M-token fp16 crossover run did not complete.*
 
 - Training is fully stable across all configs: no NaN, no divergence, no primitive collapse
 - Primitive entropy stays healthy throughout (~2.5+ at end of ternary runs)
@@ -94,27 +128,32 @@ All runs trained to 15,255 steps on identical data with batch=8, grad_accum=8, s
 ### Throughput (RTX 4070, batch=8, seq=512, fwd+bwd)
 
 | Config | Eager (ms) | Compiled (ms) | tok/s (compiled) |
-|--------|-----------|---------------|-----------------|
+|--------|:---------:|:-------------:|:----------------:|
 | Dense-48M | 54 | 49 | ~84k |
-| PILON-48M-Ternary | 101 | 54 | ~76k |
-| **Ratio** | 1.88x | **1.10x** | - |
+| PILON-48M-Ternary | 101 | **54** | ~76k |
+| **Ratio** | 1.88x | **1.10x** | --- |
 
-`torch.compile` fuses PILON's many small elementwise kernels (ternary quantization, RMSNorm, sqrt scaling, etc.) into a handful of Triton kernels, closing the throughput gap almost entirely. Without compile, PILON suffers from ~560 tiny CUDA kernel launches per iteration vs ~32 for dense.
+> [!TIP]
+> `torch.compile` fuses PILON's many small elementwise kernels (ternary quantization, RMSNorm, sqrt scaling, etc.) into a handful of Triton kernels, closing the throughput gap almost entirely. Without compile, PILON suffers from ~560 tiny CUDA kernel launches per iteration vs ~32 for dense. Always use `--compile`.
 
 ### Compute Math (Why PILON Should Be Efficient)
 
 Per token, per layer at 48M config:
 
 | | Multiplies | % of Dense |
-|---|-----------|------------|
+|---|:---------:|:----------:|
 | Dense FFN | ~2.1M | 100% |
 | PILON FFN (top-8 of 48, rank 48) | ~1.0M | **48%** |
 
 PILON does roughly half the FLOPs of a dense FFN. The compiled profiler confirms this: PILON matmul time (67ms) < Dense matmul time (72ms) across identical workloads.
 
+---
+
 ## Quickstart
 
-### Setup (Windows)
+<details>
+<summary><b>Windows Setup</b></summary>
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -123,19 +162,27 @@ pip install -r requirements.txt
 pip install triton-windows
 ```
 
-### Setup (Linux)
+</details>
+
+<details>
+<summary><b>Linux Setup</b></summary>
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+</details>
+
 ### Smoke Test
+
 ```bash
 python -m pilon_r.train --smoke-test --device cuda
 ```
 
 ### Train 48M Ternary PILON
+
 ```bash
 python -m pilon_r.train \
     --model-size 48m \
@@ -163,26 +210,32 @@ python -m pilon_r.train \
 ```
 
 Or use the provided scripts:
+
 ```bash
 bash scripts/run_48m_ternary_crossover.sh   # 48M, 500M tokens
 bash scripts/run_360m_ternary_crossover.sh  # 360M, 1B tokens, torch.compile
 ```
 
 ### Profile Throughput
+
 ```bash
 python scripts/profile_pilon.py
 ```
 
 ### Evaluate / Generate
+
 ```bash
 python -m pilon_r.evaluate outputs/48m_ternary/final_model.pt --device cuda
 ```
 
 ### SFT Fine-tuning
+
 ```bash
 python -m pilon_r.sft outputs/48m_ternary/final_model.pt \
     --epochs 1 --output-dir outputs/48m_ternary_sft --device cuda
 ```
+
+---
 
 ## Key Training Features
 
@@ -192,6 +245,8 @@ python -m pilon_r.sft outputs/48m_ternary/final_model.pt \
 - **Progressive band unfreezing**: Early band trains first, then middle, then late
 - **Ternary weight caching**: Pre-quantize all primitives once per optimizer step, reuse via index_select across gradient accumulation micro-batches
 - **`torch.compile`**: ~1.9x speedup on PILON by fusing elementwise ops into Triton kernels
+
+---
 
 ## Key CLI Flags
 
@@ -208,7 +263,12 @@ python -m pilon_r.sft outputs/48m_ternary/final_model.pt \
 | `--checkpoint-ffn` / `--no-checkpoint-ffn` | Gradient checkpointing for FFN (VRAM vs speed) |
 | `--log-comp-stats` | Log composition weight statistics |
 
+---
+
 ## Project Structure
+
+<details>
+<summary><b>Full file tree</b></summary>
 
 ```
 pilon_r/
@@ -245,6 +305,8 @@ docs/
   commands.md                  Common commands reference
 ```
 
+</details>
+
 ## Outputs
 
 Training runs write to `outputs/` by default. Each run saves:
@@ -253,18 +315,43 @@ Training runs write to `outputs/` by default. Each run saves:
 - `config.json` — Full model + training configuration
 - Periodic checkpoints at configurable intervals
 
+---
+
 ## Research Status
 
+```mermaid
+flowchart LR
+    P0["Phase 0\nRepresentation\nViability"]
+    PA["Phase A\nTraining From\nScratch"]
+    PB["Phase B\nOptimization &\nThroughput"]
+    PB5["Phase B.5\nStructural\nAdvantages"]
+    TQ["Ternary\nQuantization"]
+    PC["Phase C\nSSM / MLA"]
+    PD["Phase D\nReasoning"]
+
+    P0 --> PA --> PB --> PB5 --> TQ --> PC --> PD
+
+    style P0 fill:#2ecc71,color:#fff
+    style PA fill:#2ecc71,color:#fff
+    style PB fill:#2ecc71,color:#fff
+    style PB5 fill:#2ecc71,color:#fff
+    style TQ fill:#2ecc71,color:#fff
+    style PC fill:#95a5a6,color:#fff
+    style PD fill:#95a5a6,color:#fff
+```
+
 | Phase | Status | Outcome |
-|-------|--------|---------|
-| Phase 0: Representation Viability | Complete | Low-rank primitives can represent FFN structure |
-| Phase A: Training From Scratch | Complete | Stable training, learns language, no collapse |
-| Phase B: Optimization & Throughput | Complete | ~200k tok/s, 1.22x convergence gap |
-| Phase B.5: Structural Advantages | Complete | Tiered banks, early exit, sparse compute path |
-| Ternary Quantization (BitNet b1.58) | Complete | {-1,0,1} weights, 1.10x compiled throughput ratio |
-| Phase C: SSM/MLA Integration | Planned | Long context, memory efficiency |
-| Phase D: Reasoning Integration | Planned | R1-style inference-time reasoning |
+|-------|:------:|---------|
+| Phase 0: Representation Viability | :white_check_mark: | Low-rank primitives can represent FFN structure |
+| Phase A: Training From Scratch | :white_check_mark: | Stable training, learns language, no collapse |
+| Phase B: Optimization & Throughput | :white_check_mark: | ~200k tok/s, 1.22x convergence gap |
+| Phase B.5: Structural Advantages | :white_check_mark: | Tiered banks, early exit, sparse compute path |
+| Ternary Quantization (BitNet b1.58) | :white_check_mark: | {-1,0,1} weights, 1.10x compiled throughput ratio |
+| Phase C: SSM/MLA Integration | :hourglass: | Long context, memory efficiency |
+| Phase D: Reasoning Integration | :hourglass: | R1-style inference-time reasoning |
+
+---
 
 ## License
 
-MIT License (see `LICENSE`).
+MIT License (see [`LICENSE`](LICENSE)).
