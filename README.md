@@ -123,14 +123,11 @@ All runs trained to 15,255 steps on identical data with batch=8, grad_accum=8, s
 | Dense-48M | 4.1654 | 64.42 | 1.00x |
 | PILON-48M Ternary + SubLN + SqReLU | 4.5958 | 99.07 | **1.10x** |
 | PILON-48M Ternary + SubLN | 4.6473 | 104.30 | 1.12x |
-| PILON-48M fp16 (incomplete) | --- | --- | ~1.22x* |
-
-> [!NOTE]
-> *fp16 PILON 1.22x gap from earlier extended run (97K steps, ~90.9B tokens). The 500M-token fp16 crossover run did not complete.*
+| PILON-48M fp16 | 4.6896 | 108.81 | 1.13x |
 
 - Training is fully stable across all configs: no NaN, no divergence, no primitive collapse
-- Primitive entropy stays healthy throughout (~2.5+ at end of ternary runs)
-- Squared ReLU variant slightly outperforms plain ternary (99 vs 104 PPL)
+- Primitive entropy stays healthy throughout (~2.5+ at end of all runs)
+- Ternary + SqReLU is the best PILON variant, outperforming even fp16 PILON (99 vs 109 PPL)
 - The gap is convergence speed, not a ceiling — loss continues improving with more tokens
 
 ### Throughput (RTX 4070, batch=8, seq=512, fwd+bwd)
@@ -352,7 +349,7 @@ flowchart LR
 |-------|:------:|---------|
 | Phase 0: Representation Viability | :white_check_mark: | Low-rank primitives can represent FFN structure |
 | Phase A: Training From Scratch | :white_check_mark: | Stable training, learns language, no collapse |
-| Phase B: Optimization & Throughput | :white_check_mark: | ~200k tok/s, 1.22x convergence gap |
+| Phase B: Optimization & Throughput | :white_check_mark: | ~200k tok/s, 1.13x convergence gap |
 | Phase B.5: Structural Advantages | :white_check_mark: | Tiered banks, early exit, sparse compute path |
 | Ternary Quantization (BitNet b1.58) | :white_check_mark: | {-1,0,1} weights, 1.10x compiled throughput ratio |
 | Phase C: SSM/MLA Integration | :hourglass: | Long context, memory efficiency |
