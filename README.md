@@ -6,6 +6,14 @@ PILON-R replaces dense FFN weight matrices in transformers with shared low-rank 
 
 The result: competitive language modeling quality at a fraction of the FFN parameter cost, with structural knobs (rank scheduling, progressive unfreezing, tiered VRAM loading, early exit) that dense FFNs simply cannot offer.
 
+### The Simple Version
+
+Think of a standard transformer like a library where every shelf holds a completely separate collection of books — if you need an answer, each layer searches its own entire collection from scratch, even though most shelves contain a lot of the same reference material.
+
+PILON takes a different approach. Instead of giving every shelf its own full collection, we build a single shared reference section of small, reusable building blocks ("primitives"). Each shelf only needs a short recipe card that says *"grab these 8 blocks and combine them like this."* The building blocks are tiny (low-rank), the recipe cards are cheap, and most of the knowledge is shared — so you get nearly the same answers while doing roughly **half the math** and storing far fewer total books.
+
+On top of that, PILON can constrain its building blocks to just three values ($-1$, $0$, $+1$) — the equivalent of writing the reference material in shorthand. This **ternary quantization** makes the model even more compact with minimal quality loss.
+
 ---
 
 ## How It Works
