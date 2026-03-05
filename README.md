@@ -1,8 +1,8 @@
-# PILON-R
+# PILON
 
-**Primitive-Induced Linear Operator Network with Reasoning**
+**Primitive-Induced Linear Operator Network**
 
-PILON-R replaces dense FFN weight matrices in transformers with shared low-rank primitives combined via learned per-layer composition weights. Instead of storing full `(d_model, d_ff)` matrices per layer, a small bank of low-rank primitives is shared across layers within a band, and each layer learns *which* primitives to combine and *how* to weight them.
+PILON replaces dense FFN weight matrices in transformers with shared low-rank primitives combined via learned per-layer composition weights. Instead of storing full `(d_model, d_ff)` matrices per layer, a small bank of low-rank primitives is shared across layers within a band, and each layer learns *which* primitives to combine and *how* to weight them.
 
 The result: competitive language modeling quality at a fraction of the FFN parameter cost, with structural knobs (rank scheduling, progressive unfreezing, tiered VRAM loading, early exit) that dense FFNs simply cannot offer.
 
