@@ -333,17 +333,9 @@ class PrimitiveBank(nn.Module):
         Returns:
             Output tensor (batch, seq, d_out)
         """
-        # Support rank scheduling
-        A = self.A[:, :, :active_rank] if active_rank is not None else self.A
-        B = self.B[:, :active_rank, :] if active_rank is not None else self.B
-        if active_rank is not None:
-            scale = self.latent_scale[:active_rank]
-            bias = self.latent_bias[:active_rank]
-        else:
-            scale = self.latent_scale
-            bias = self.latent_bias
-
         # Support active primitive scheduling
+        A = self.A
+        B = self.B
         if active_primitives is not None and active_primitives < self.n_primitives:
             active_primitives = max(1, active_primitives)
             A = A[:active_primitives]
@@ -361,8 +353,19 @@ class PrimitiveBank(nn.Module):
             B = B.index_select(0, top_indices)
             weights = top_weights
 
-        # Ternary quantization (no-op when ternary=False)
+        # Ternary quantization on full rank (matches cached path behaviour)
         A, B, scale_A, scale_B = self._quantize_weights(A, B)
+
+        # Rank scheduling: slice after quantization so scale is consistent
+        # with forward_topk_fused/forward_sparse which quantize full then slice
+        if active_rank is not None:
+            A = A[:, :, :active_rank]
+            B = B[:, :active_rank, :]
+            scale = self.latent_scale[:active_rank]
+            bias = self.latent_bias[:active_rank]
+        else:
+            scale = self.latent_scale
+            bias = self.latent_bias
         x, scale_x, Qb = self._quantize_input(x)
 
         batch, seq, _ = x.shape
@@ -541,6 +544,10 @@ class PrimitiveBank(nn.Module):
 
         # Only gather the selected primitives (use cache if available)
         A_sel, B_sel, scale_A, scale_B = self._quantize_weights_or_cache(top_indices)
+        # Apply rank scheduling to selected primitives (cache stores full rank)
+        if active_rank is not None:
+            A_sel = A_sel[:, :, :active_rank]
+            B_sel = B_sel[:, :active_rank, :]
         x, scale_x, Qb = self._quantize_input(x)
 
         batch, seq, _ = x.shape

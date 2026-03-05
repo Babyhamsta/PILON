@@ -794,9 +794,9 @@ def save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "step": step,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": unwrap_model(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "config": model.config,  # Save ModelConfig for evaluation
+        "config": unwrap_model(model).config,  # Save ModelConfig for evaluation
         "train_config": config,  # Save TrainingConfig for resumption/info
     }
     if scaler is not None:
@@ -1644,7 +1644,7 @@ def train_v2(args: argparse.Namespace) -> None:
                         primitive_group_lr = float(group.get("lr", 0.0))
                     elif group.get("name") == "composition":
                         composition_group_lr = float(group.get("lr", 0.0))
-                entropy_vals = model.get_all_entropy()
+                entropy_vals = raw_model.get_all_entropy()
                 mean_entropy = sum(entropy_vals.values()) / max(1, len(entropy_vals)) if entropy_vals else 0.0
 
                 log_dict.update({
