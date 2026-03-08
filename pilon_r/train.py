@@ -704,14 +704,18 @@ def build_optimizer(
     return SparseAwareAdamW(param_groups, betas=(0.9, 0.95))
 
 
-def apply_phase_lrs(optimizer: Optimizer, base_lr: float, phase: int) -> None:
+def apply_phase_lrs(optimizer: Optimizer, base_lr: float, phase: int,
+                    freeze_primitives_phase2: bool = False) -> None:
     if phase == 1:
-        # Give composition a tiny LR even in Phase 1 to prevent state freeze
-        multipliers = {"primitives": 2.0, "composition": 0.01, "base": 1.0}
+        # Primitives train, compositions frozen via LR=0
+        multipliers = {"primitives": 2.0, "composition": 0.0, "base": 1.0}
     elif phase == 2:
-        multipliers = {"primitives": 0.5, "composition": 1.0, "base": 0.75}
+        # Compositions train; primitives frozen via LR=0 if requested
+        prim_mult = 0.0 if freeze_primitives_phase2 else 0.5
+        multipliers = {"primitives": prim_mult, "composition": 1.0, "base": 0.75}
     else:
-        multipliers = {"primitives": 0.25, "composition": 0.5, "base": 0.5}
+        prim_mult = 0.0 if freeze_primitives_phase2 else 0.25
+        multipliers = {"primitives": prim_mult, "composition": 0.5, "base": 0.5}
 
     for group in optimizer.param_groups:
         name = group.get("name", "base")
@@ -722,9 +726,11 @@ def apply_phase_lrs_with_override(
     optimizer: Optimizer,
     base_lr: float,
     phase: int,
-    composition_lr_mult: Optional[float]
+    composition_lr_mult: Optional[float],
+    freeze_primitives_phase2: bool = False,
 ) -> None:
-    apply_phase_lrs(optimizer, base_lr, phase)
+    apply_phase_lrs(optimizer, base_lr, phase,
+                    freeze_primitives_phase2=freeze_primitives_phase2)
     if composition_lr_mult is None or phase == 1:
         return
     for group in optimizer.param_groups:
@@ -1273,6 +1279,10 @@ def train_v2(args: argparse.Namespace) -> None:
     if is_compositional and model_config.primitive_config.moe_config is not None:
         moe_aux_loss_weight = float(model_config.primitive_config.moe_config.aux_loss_weight)
 
+    is_compiled = args.compile and hasattr(model, "_orig_mod")
+    recompile_phases = args.recompile_phases and is_compiled
+    prev_phase = 0  # Will trigger initial phase setup on first step
+
     for step in range(start_step, train_config.total_steps):
         data_s = 0.0
         fwd_s = 0.0
@@ -1360,13 +1370,24 @@ def train_v2(args: argparse.Namespace) -> None:
             apply_runtime_step_and_cache(raw_model, step, topk_cache_steps)
             raw_model.update_caches()
 
-            # Phase-specific parameter training
-            if phase == 1:
-                set_composition_requires_grad(raw_model, False)
-                set_primitive_requires_grad(raw_model, True)
-            else:
-                set_composition_requires_grad(raw_model, True)
-                set_primitive_requires_grad(raw_model, not freeze_primitives_phase2)
+            # Phase-specific parameter freezing
+            if recompile_phases and phase != prev_phase:
+                # Toggle requires_grad for proper freezing (no wasted grad compute)
+                # then recompile so torch.compile builds a new optimized graph
+                if phase == 1:
+                    set_primitive_requires_grad(raw_model, True)
+                    set_composition_requires_grad(raw_model, False)
+                elif phase >= 2:
+                    if freeze_primitives_phase2:
+                        set_primitive_requires_grad(raw_model, False)
+                    set_composition_requires_grad(raw_model, True)
+                torch._dynamo.reset()
+                torch._dynamo.config.capture_scalar_outputs = True
+                model = torch.compile(raw_model)
+                logger.info(f"Phase {prev_phase}->{phase}: recompiled model "
+                            f"(primitives_grad={not (phase >= 2 and freeze_primitives_phase2)}, "
+                            f"composition_grad={phase >= 2})")
+            prev_phase = phase
 
             cache_frozen_primitives = phase >= 2 and freeze_primitives_phase2
             for layer in raw_model.layers:
@@ -1394,7 +1415,8 @@ def train_v2(args: argparse.Namespace) -> None:
         base_lr = compute_base_lr(step, train_config)
         sparse_lr_mult = 1.0
         if is_compositional:
-            apply_phase_lrs_with_override(optimizer, base_lr, phase, comp_lr_mult)
+            apply_phase_lrs_with_override(optimizer, base_lr, phase, comp_lr_mult,
+                                         freeze_primitives_phase2=freeze_primitives_phase2)
             sparse_lr_mult = compute_sparse_lr_multiplier(
                 is_moe=is_moe,
                 n_primitives=n_primitives,
@@ -1890,6 +1912,10 @@ def main() -> None:
     parser.add_argument("--no-moe-load-balancing", action="store_true",
                         help="Disable MoE load balancing loss")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument("--recompile-phases", action="store_true",
+                        help="Recompile model at phase boundaries (requires --compile). "
+                             "Uses requires_grad=False for frozen params + torch._dynamo.reset() "
+                             "instead of LR=0, eliminating wasted gradient computation.")
     parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 matmul")
 
     parser.add_argument("--progressive-unfreeze", action="store_true")
