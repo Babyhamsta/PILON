@@ -614,46 +614,36 @@ class CompositionalGatedRecurrence(nn.Module):
         v = v.view(batch_size, seq_len, self.n_heads, self.d_head)
         gate = gate.view(batch_size, seq_len, self.n_heads, self.d_head)
 
-        if past_kv is not None:
-            # Incremental generation: sequential (T is typically 1)
-            state = past_kv
-            outputs = []
-            for t in range(seq_len):
-                decay_t = torch.exp(-F.softplus(self.decay_proj(x[:, t]))).unsqueeze(-1)
-                gate_t = torch.sigmoid(gate[:, t])
-                kv_t = gate_t * k[:, t] * v[:, t]
-                state = decay_t * state + kv_t
-                outputs.append(q[:, t] * state)
-            out = torch.stack(outputs, dim=1)
-        else:
-            # Training / prefill: Griffin log-space + chunked parallel scan
-            log_decay = -F.softplus(self.decay_proj(x)).unsqueeze(-1)  # (B, T, H, 1)
-            gate_act = torch.sigmoid(gate)  # (B, T, H, D)
-            kv = gate_act * k * v  # (B, T, H, D)
+        # Griffin-style log-space decay, broadcast to per-key-dim for GLA
+        log_decay = -F.softplus(self.decay_proj(x))  # (B, T, H)
+        log_decay = log_decay.unsqueeze(-1).expand(-1, -1, -1, self.d_head)  # (B, T, H, K)
 
-            CHUNK_SIZE = 64
-            n_chunks = (seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
-            state = torch.zeros(
-                batch_size, self.n_heads, self.d_head,
-                device=x.device, dtype=torch.float32,
+        # Apply input gate to k (GLA folds gating into k)
+        k_gated = k * torch.sigmoid(gate)
+
+        if past_kv is not None:
+            # Incremental generation
+            from fla.ops.gla import fused_recurrent_gla
+            out, state = fused_recurrent_gla(
+                q=q.contiguous(),
+                k=k_gated.contiguous(),
+                v=v.contiguous(),
+                gk=log_decay.contiguous(),
+                scale=1.0,
+                initial_state=past_kv,
+                output_final_state=True,
             )
-            all_outputs = []
-            for c in range(n_chunks):
-                s = c * CHUNK_SIZE
-                e = min(s + CHUNK_SIZE, seq_len)
-                ld = log_decay[:, s:e].float()
-                kvc = kv[:, s:e].float()
-                qc = q[:, s:e]
-                cum_ld = torch.cumsum(ld, dim=1)
-                # Max-shift trick: all exponents <= 0, no overflow
-                cum_last = cum_ld[:, -1:, :, :]
-                kv_shifted = kvc * torch.exp(cum_last - cum_ld)
-                new = torch.exp(cum_ld - cum_last) * torch.cumsum(kv_shifted, dim=1)
-                carry = state.unsqueeze(1) * torch.exp(cum_ld)
-                chunk_states = carry + new
-                all_outputs.append(qc * chunk_states.to(qc.dtype))
-                state = chunk_states[:, -1]
-            out = torch.cat(all_outputs, dim=1)
+        else:
+            # Training / prefill: GLA Triton kernel
+            from fla.ops.gla import chunk_gla
+            out, state = chunk_gla(
+                q=q.contiguous(),
+                k=k_gated.contiguous(),
+                v=v.contiguous(),
+                g=log_decay.contiguous(),
+                scale=1.0,
+                output_final_state=True,
+            )
 
         out = out.reshape(batch_size, seq_len, self.hidden_dim)
         out = self.recurrence_norm(out)

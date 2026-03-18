@@ -439,17 +439,50 @@ Extensive debugging revealed that naive implementations of gated linear recurren
 2. **Backward gradient explosion:** Ternary STE produces occasional gradient spikes that amplify through the multiplicative recurrence chain. Fix: Griffin log-space gating (additive gradients instead of multiplicative).
 3. **Data-dependent NaN:** Certain real data distributions trigger edge cases not caught by fixed-batch tests. Fix: `flash-linear-attention` library's production Triton kernels handle all numerical edge cases correctly.
 
+### C3: Compositional Gated Recurrence (Partial — Stopped Early)
+
+Gated recurrence (like C2) but with compositional Q/K/V/gate projections via primitive banks (like C1). Tests whether sharing projections helps when combined with recurrence.
+
+| Step | C3 (comp rec) | C2 (gated rec) | C0 (standard MHA) |
+|------|:-:|:-:|:-:|
+| 1000 | 5.67 / 290 | 5.68 / 292 | 5.73 / 308 |
+| 2000 | 5.20 / 181 | 5.18 / 178 | 5.25 / 191 |
+| 3000 | 4.95 / 141 | 4.93 / 138 | 4.97 / 144 |
+| 3500 | 5.02 / 151 | 4.86 / 129 | 4.87 / 131 |
+
+**Finding:** Compositional projections are neutral at best with recurrence — C3 matches C2's quality through 3,000 steps but is ~40% slower (~19-27k vs ~35k tok/s) due to the primitive bank projection overhead. Stopped at step 3,600 (DataLoader shared memory exhaustion, not NaN). No reason to run to completion.
+
+**Conclusion on compositional projections:** Whether paired with softmax (C1, worse) or recurrence (C3, neutral), sharing Q/K/V projections via primitive banks does not improve quality. The projections are too small relative to the FFN to benefit from low-rank sharing.
+
+### C4: Hybrid (Skipped)
+
+C4 would combine recurrence in early/middle layers with MHA in late layers. Given that C2 (pure recurrence) already outperforms C0 (pure MHA), and C3 showed compositional projections don't help, C4's hybrid approach is unlikely to beat C2. Skipped.
+
 ### Phase C Run Matrix
 
 | Run | Attention | FFN | Val Loss | Val PPL | Status |
 |-----|-----------|-----|:-:|:-:|--------|
 | C0 | Standard MHA | PILON Ternary | 4.596 | 99.1 | Complete (prior run) |
-| C1 | Compositional MHA | PILON Ternary | 4.870 | 130.3 | Complete |
-| C2 | Gated Recurrence | PILON Ternary | 4.455 | 85.9 | Complete (1.07x loss / 1.33x PPL vs dense) |
-| C3 | Compositional Gated Rec | PILON Ternary | — | — | Pending |
-| C4 | Hybrid (rec + MHA) | PILON Ternary | — | — | Pending |
+| C1 | Compositional MHA | PILON Ternary | 4.870 | 130.3 | Complete — sharing hurts |
+| C2 | Gated Recurrence | PILON Ternary | 4.455 | 85.9 | Complete — best variant (1.07x / 1.33x vs dense) |
+| C3 | Compositional Gated Rec | PILON Ternary | ~4.95* | ~141* | Stopped at step 3,500 — neutral vs C2, slower |
+| C4 | Hybrid (rec + MHA) | PILON Ternary | — | — | Skipped |
 
-> Source: `outputs/48m_phase_c1_comp_attn/`, `outputs/48m_phase_c2_gated_rec/`
+\* C3 values at step 3,000; run stopped early.
+
+> Source: `outputs/48m_phase_c1_comp_attn/`, `outputs/48m_phase_c2_gated_rec/`, `outputs/48m_phase_c3_comp_gated_rec/`
+
+### Phase C Summary
+
+PILON's compositional FFN pairs better with smooth state-update recurrence than with standard softmax attention. The key results:
+
+1. **Gated recurrence (C2) is the best attention for PILON** — 1.07x loss / 1.33x PPL vs dense, improving on standard MHA's 1.10x / 1.54x
+2. **Compositional Q/K/V projections don't help** — whether paired with softmax (C1) or recurrence (C3), sharing the small projection matrices via primitive banks is neutral or harmful
+3. **The practical win is memory** — recurrence has O(T) memory with no KV cache, compared to O(T²) for attention
+4. **Why recurrence works better is unproven** — gradient flow differences (HoloTern showed Q/K gradient starvation in softmax) are a plausible hypothesis but not causally demonstrated
+5. **flash-linear-attention is essential** — naive PyTorch implementations of gated linear recurrence produce NaN with ternary quantization; the GLA Triton kernel handles all numerical edge cases
+
+> Source: `outputs/48m_phase_c1_comp_attn/`, `outputs/48m_phase_c2_gated_rec/`, `outputs/48m_phase_c3_comp_gated_rec/`
 
 ---
 
@@ -469,13 +502,14 @@ Extensive debugging revealed that naive implementations of gated linear recurren
 - [x] Ternary quantization (500M token crossover complete, 1.10x loss ratio)
 - [x] fp16 PILON crossover (500M tokens, 1.13x loss ratio — ternary is better)
 - [x] Phase C1: Compositional attention (shared Q/K/V projections — 6% worse than standard)
-- [x] Phase C2: Gated linear recurrence (beats standard MHA by 3% — best PILON variant)
+- [x] Phase C2: Gated linear recurrence (1.07x/1.33x vs dense — best PILON variant)
+- [x] Phase C3: Compositional gated recurrence (neutral vs C2, slower — stopped early)
+- [x] Phase C4: Hybrid (skipped — C2 already best)
 
 ### Pending
 
-- [ ] Phase C3/C4: Compositional recurrence and hybrid attention experiments
-- [ ] Run 360M ternary crossover experiment
 - [ ] Scale C2 (gated recurrence) to 360M
+- [ ] Run 360M ternary crossover experiment
 - [ ] Phase D: Reasoning integration (R1-style)
 
 ---
@@ -500,6 +534,7 @@ Extensive debugging revealed that naive implementations of gated linear recurren
 | Mar 17 | Phase C1 compositional MHA complete | 6% worse than standard — Q/K/V too small for sharing |
 | Mar 18 | Phase C2 gated recurrence complete | **Beats standard MHA by 3%** — best PILON variant |
 | Mar 18 | Adopted flash-linear-attention for GLA kernel | Solves ternary + recurrence NaN instability |
+| Mar 18 | Phase C complete: C2 gated recurrence is default | Compositional projections don't help attention |
 
 ---
 
