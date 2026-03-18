@@ -414,14 +414,16 @@ Replace softmax attention entirely with O(T) gated linear recurrence. Uses `flas
 
 | Metric | C2 (Gated Recurrence) | C0 (Standard MHA) | Dense |
 |--------|:-:|:-:|:-:|
-| Val Loss | **4.455** | 4.596 | 4.165 |
-| Val PPL | **85.9** | 99.1 | 64.4 |
-| vs C0 | **0.97x loss** | — | — |
-| vs Dense | 1.07x loss | 1.10x loss | — |
+| Val Loss | 4.455 | 4.596 | 4.165 |
+| Val PPL | 85.9 | 99.1 | 64.4 |
+| Loss ratio vs Dense | 1.07x | 1.10x | — |
+| PPL ratio vs Dense | 1.33x | 1.54x | — |
 | Throughput | ~35k tok/s | ~34k tok/s | ~42k tok/s |
 | Duration | 3.80 hrs | 4.4 hrs | 3.4 hrs |
 
-**Finding:** Gated recurrence **outperforms standard softmax attention** by 3% in loss (13% in PPL) when paired with PILON's ternary FFN. O(T) complexity vs O(T²), no KV cache needed. This is the best PILON variant to date.
+**Finding:** PILON's compositional FFN appears to pair better with a smooth state-update recurrence than with standard softmax attention. C2 achieves 1.07x loss / 1.33x PPL vs dense, compared to C0's 1.10x / 1.54x. The mechanism is not yet understood — gradient flow differences (observed in HoloTern experiments showing Q/K gradient starvation in softmax attention) are a plausible hypothesis but unproven.
+
+The practical advantage of gated recurrence is **zero KV cache** — O(T) memory with fixed-size recurrent state for generation. Wall-clock throughput is comparable to standard MHA (~35k vs ~34k tok/s).
 
 **Key implementation details:**
 - Griffin-style log-space decay: `log_decay = -softplus(w)` for stable gradients
@@ -443,7 +445,7 @@ Extensive debugging revealed that naive implementations of gated linear recurren
 |-----|-----------|-----|:-:|:-:|--------|
 | C0 | Standard MHA | PILON Ternary | 4.596 | 99.1 | Complete (prior run) |
 | C1 | Compositional MHA | PILON Ternary | 4.870 | 130.3 | Complete |
-| **C2** | **Gated Recurrence** | **PILON Ternary** | **4.455** | **85.9** | **Complete — best result** |
+| C2 | Gated Recurrence | PILON Ternary | 4.455 | 85.9 | Complete (1.07x loss / 1.33x PPL vs dense) |
 | C3 | Compositional Gated Rec | PILON Ternary | — | — | Pending |
 | C4 | Hybrid (rec + MHA) | PILON Ternary | — | — | Pending |
 
