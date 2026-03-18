@@ -406,7 +406,6 @@ class GatedLinearRecurrence(nn.Module):
             nn.init.xavier_uniform_(proj.weight)
         nn.init.xavier_uniform_(self.decay_proj.weight)
 
-    @torch.compiler.disable
     def _forward_parallel(
         self,
         x: torch.Tensor,
@@ -415,92 +414,42 @@ class GatedLinearRecurrence(nn.Module):
         v: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Parallel linear recurrence using Griffin-style log-space gating
-        with chunked scan for forward numerical stability.
+        Parallel linear recurrence via flash-linear-attention's chunk_gla kernel.
 
-        Griffin log-space gating: decay = exp(-softplus(w))
-        - Gradients flow through softplus/exp (additive in log-space)
-        - No multiplicative gradient chains
+        Uses production-quality Triton kernels that handle all numerical edge
+        cases (log-space gating, chunked scan, proper backward). No manual
+        overflow handling needed.
 
-        Chunked scan via reshape: reshape (B, T, ...) into (B*n_chunks, C, ...)
-        and use vectorized cumsum. Cross-chunk state carry is sequential but
-        only n_chunks iterations (8 for T=512, C=64).
-
-        Reference: Griffin (ICLR 2025)
+        The GLA recurrence is: s_t = diag(exp(g_t)) * s_{t-1} + k_t^T * v_t
+        with output o_t = q_t * s_t, where g is the log-space forget gate.
         """
+        from fla.ops.gla import chunk_gla
+
         batch_size, seq_len, _, _ = q.shape
 
-        # Griffin-style log-space decay: always negative, numerically stable
-        log_decay = -F.softplus(self.decay_proj(x)).unsqueeze(-1)  # (B, T, H, 1)
+        # Griffin-style log-space decay: always negative
+        # GLA expects g per key-dimension: (B, T, H, K)
+        # Our decay is per-head, so broadcast: (B, T, H, 1) -> (B, T, H, K)
+        log_decay = -F.softplus(self.decay_proj(x))  # (B, T, H)
+        log_decay = log_decay.unsqueeze(-1).expand(-1, -1, -1, self.d_head)  # (B, T, H, K)
 
-        # Input gate: (B, T, H, D)
+        # Input gate applied to k (GLA folds gating into k)
         gate = torch.sigmoid(
             self.gate_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head)
         )
+        k_gated = k * gate  # (B, T, H, K)
 
-        # Gated key-value product: (B, T, H, D)
-        kv = gate * k * v
-
-        # --- Chunked parallel scan (vectorized within chunks) ---
-        CHUNK_SIZE = 64
-        # Pad to multiple of CHUNK_SIZE
-        pad = (CHUNK_SIZE - seq_len % CHUNK_SIZE) % CHUNK_SIZE
-        if pad > 0:
-            log_decay = F.pad(log_decay, (0, 0, 0, 0, 0, pad))  # pad time dim
-            kv = F.pad(kv, (0, 0, 0, 0, 0, pad))
-            q = F.pad(q, (0, 0, 0, 0, 0, pad))
-        padded_len = seq_len + pad
-        n_chunks = padded_len // CHUNK_SIZE
-
-        # Reshape into chunks: (B, n_chunks, C, H, D/1)
-        log_d = log_decay.float().view(batch_size, n_chunks, CHUNK_SIZE, self.n_heads, 1)
-        kv_c = kv.float().view(batch_size, n_chunks, CHUNK_SIZE, self.n_heads, self.d_head)
-        q_c = q.view(batch_size, n_chunks, CHUNK_SIZE, self.n_heads, self.d_head)
-
-        # Within-chunk cumulative log-decay: (B, n_chunks, C, H, 1)
-        cum_log_d = torch.cumsum(log_d, dim=2)
-
-        # Within-chunk parallel scan using max-shift for numerical stability.
-        # Instead of exp(-cum) which can overflow, compute:
-        #   new_t = sum_{i=0}^{t} kv_i * exp(cum_t - cum_i)
-        # By shifting by cum_t (the last position's cumulative), we get:
-        #   kv_shifted_i = kv_i * exp(cum_C - cum_i)  (bounded: max = exp(0) = 1 at i=C)
-        #   new_t = exp(cum_t - cum_C) * cumsum(kv_shifted)[t]
-        # where cum_C - cum_i is always <= 0 (since cum is monotonically decreasing)
-        # and cum_t - cum_C <= 0, so all exponents are <= 0. No overflow possible.
-        cum_last = cum_log_d[:, :, -1:, :, :]  # (B, nc, 1, H, 1)
-        kv_shifted = kv_c * torch.exp(cum_last - cum_log_d)  # exp <= 0, bounded
-        new = torch.exp(cum_log_d - cum_last) * torch.cumsum(kv_shifted, dim=2)
-
-        # Cross-chunk state carry (sequential, but only n_chunks iterations)
-        state = torch.zeros(
-            batch_size, 1, 1, self.n_heads, self.d_head,
-            device=x.device, dtype=torch.float32,
+        # chunk_gla handles the full recurrence with proper numerics
+        # q, k, v: (B, T, H, K/V), g: (B, T, H, K) — log-space forget gate
+        out, final_state = chunk_gla(
+            q=q.contiguous(),
+            k=k_gated.contiguous(),
+            v=v.contiguous(),
+            g=log_decay.contiguous(),
+            scale=1.0,  # We handle scaling ourselves
+            output_final_state=True,
         )
-        carries = []
-        for c in range(n_chunks):
-            carry = state * torch.exp(cum_log_d[:, c:c+1])
-            carries.append(carry)
-            state = carry[:, :, -1:] + new[:, c:c+1, -1:]
-
-        carries = torch.cat(carries, dim=1)  # (B, nc, C, H, D)
-        chunk_states = carries + new  # (B, nc, C, H, D)
-
-        # Query-weighted readout
-        out = q_c * chunk_states.to(q_c.dtype)  # (B, nc, C, H, D)
-
-        # Reshape back and trim padding
-        out = out.view(batch_size, padded_len, self.n_heads, self.d_head)
-        if pad > 0:
-            out = out[:, :seq_len]
-
-        final_state = chunk_states[:, -1, -1].to(kv.dtype)  # (B, H, D)
-        # Trim padding positions from final state if needed
-        if pad > 0:
-            # Recompute from the actual last position
-            actual_last_chunk = (seq_len - 1) // CHUNK_SIZE
-            actual_last_pos = (seq_len - 1) % CHUNK_SIZE
-            final_state = chunk_states[:, actual_last_chunk, actual_last_pos].to(kv.dtype)
+        # out: (B, T, H, V), final_state: (B, H, K, V)
 
         return out, final_state
 
@@ -512,23 +461,29 @@ class GatedLinearRecurrence(nn.Module):
         v: torch.Tensor,
         initial_state: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sequential fallback for incremental generation (T is typically 1)."""
+        """Sequential/recurrent fallback for incremental generation."""
+        from fla.ops.gla import fused_recurrent_gla
+
         batch_size, seq_len, _, _ = q.shape
-        state = initial_state
 
-        outputs = []
-        for t in range(seq_len):
-            # Griffin-style: decay via exp(-softplus(w))
-            decay_t = torch.exp(-F.softplus(self.decay_proj(x[:, t]))).unsqueeze(-1)
-            gate_t = torch.sigmoid(
-                self.gate_proj(x[:, t]).view(batch_size, self.n_heads, self.d_head)
-            )
-            kv_t = gate_t * k[:, t] * v[:, t]
-            state = decay_t * state + kv_t
-            outputs.append(q[:, t] * state)
+        log_decay = -F.softplus(self.decay_proj(x))
+        log_decay = log_decay.unsqueeze(-1).expand(-1, -1, -1, self.d_head)
 
-        out = torch.stack(outputs, dim=1)
-        return out, state
+        gate = torch.sigmoid(
+            self.gate_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head)
+        )
+        k_gated = k * gate
+
+        out, final_state = fused_recurrent_gla(
+            q=q.contiguous(),
+            k=k_gated.contiguous(),
+            v=v.contiguous(),
+            gk=log_decay.contiguous(),
+            scale=1.0,
+            initial_state=initial_state,
+            output_final_state=True,
+        )
+        return out, final_state
 
     def forward(
         self,

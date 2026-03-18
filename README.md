@@ -89,6 +89,9 @@ $$w_{\text{ternary}} = \text{sign}\!\left(\text{round}\!\left(\frac{w}{\alpha}\r
 | **BandPrimitiveBanks** | Groups layers into bands that share primitive banks (separate fc1/fc2 banks) |
 | **LayerCompositionWeights** | Per-layer learned logits over primitives, softmax-normalized, top-k selected |
 | **CompositionalFFN** | Fused forward path: top-k select, concatenate, 2 GEMMs, weighted sum |
+| **GatedLinearRecurrence** | Griffin-style O(T) recurrence replacing softmax attention, via `flash-linear-attention` GLA kernel |
+| **CompositionalMHA** | Standard SDPA attention with compositional Q/K/V projections via primitive banks |
+| **HybridAttention** | Layer-dependent dispatch: recurrence for early layers, MHA for late layers |
 | **MoECompositionalFFN** | Token-dependent routing: each token picks different expert compositions |
 | **TieredPrimitiveBank** | VRAM-efficient: only `n_hot` primitives in GPU memory, rest in CPU pinned memory |
 | **ExitGate** | Per-layer gate that skips FFN computation for "easy" tokens during inference |
@@ -118,17 +121,20 @@ $$w_{\text{ternary}} = \text{sign}\!\left(\text{round}\!\left(\frac{w}{\alpha}\r
 
 All runs trained to 15,255 steps on identical data with batch=8, grad_accum=8, seq_len=512.
 
-| Model | Final Val Loss | Val PPL | vs Dense |
-|-------|:-------------:|:-------:|:--------:|
-| Dense-48M | 4.1654 | 64.42 | 1.00x |
-| PILON-48M Ternary + SubLN + SqReLU | 4.5958 | 99.07 | **1.10x** |
-| PILON-48M Ternary + SubLN | 4.6473 | 104.30 | 1.12x |
-| PILON-48M fp16 | 4.6896 | 108.81 | 1.13x |
+| Model | Attention | Final Val Loss | Val PPL | vs Dense |
+|-------|-----------|:-------------:|:-------:|:--------:|
+| Dense-48M | Standard MHA | 4.1654 | 64.42 | 1.00x |
+| **PILON + Gated Recurrence** | **GLA (O(T))** | **4.4550** | **85.94** | **1.07x** |
+| PILON Ternary + SubLN + SqReLU | Standard MHA | 4.5958 | 99.07 | 1.10x |
+| PILON Ternary + SubLN | Standard MHA | 4.6473 | 104.30 | 1.12x |
+| PILON fp16 | Standard MHA | 4.6896 | 108.81 | 1.13x |
+| PILON + Compositional MHA | Comp. MHA | 4.8699 | 130.31 | 1.17x |
 
+- **Gated linear recurrence beats standard softmax attention** by 3% loss / 13% PPL when paired with PILON's compositional FFN — the best PILON variant to date
+- Recurrence uses O(T) compute and memory (no KV cache) vs attention's O(T²)
 - Training is fully stable across all configs: no NaN, no divergence, no primitive collapse
 - Primitive entropy stays healthy throughout (~2.5+ at end of all runs)
-- Ternary + SqReLU is the best PILON variant, outperforming even fp16 PILON (99 vs 109 PPL)
-- The gap is convergence speed, not a ceiling — loss continues improving with more tokens
+- The gap vs dense is convergence speed, not a ceiling — loss continues improving with more tokens
 
 ### Throughput (RTX 4070, batch=8, seq=512, fwd+bwd)
 
@@ -262,7 +268,9 @@ python -m pilon_r.sft outputs/48m_ternary/final_model.pt \
 | `--ternary` | Enable ternary weight quantization |
 | `--use-subln` | SubLN normalization (ternary stability) |
 | `--use-squared-relu` | Squared ReLU activation |
+| `--attention-type {standard_mha,...}` | Attention variant (standard_mha, gated_recurrence, compositional_mha, hybrid) |
 | `--compile` | Enable torch.compile |
+| `--recompile-phases` | Recompile at phase boundaries for proper param freezing |
 | `--phase1-sparse` | Use top-k in phase 1 (skip dense warmup) |
 | `--freeze-primitives-phase2` | Freeze primitive banks in phase 2 |
 | `--checkpoint-ffn` / `--no-checkpoint-ffn` | Gradient checkpointing for FFN (VRAM vs speed) |
@@ -285,6 +293,7 @@ pilon_r/
 
 pilon_r/core/
   model.py                     PILONTransformer
+  attention.py                 GatedLinearRecurrence, CompositionalMHA, HybridAttention
   primitives.py                PrimitiveBank, ternary quantization, RMSNorm
   ffn.py                       CompositionalFFN, MoECompositionalFFN
   tiered_bank.py               TieredPrimitiveBank (hot/warm VRAM tiering)
@@ -331,7 +340,7 @@ flowchart LR
     PB["Phase B<br>Optimization &<br>Throughput"]
     PB5["Phase B.5<br>Structural<br>Advantages"]
     TQ["Ternary<br>Quantization"]
-    PC["Phase C<br>SSM / MLA"]
+    PC["Phase C<br>Attention<br>Experiments"]
     PD["Phase D<br>Reasoning"]
 
     P0 --> PA --> PB --> PB5 --> TQ --> PC --> PD
@@ -341,7 +350,7 @@ flowchart LR
     style PB fill:#2ecc71,color:#fff
     style PB5 fill:#2ecc71,color:#fff
     style TQ fill:#2ecc71,color:#fff
-    style PC fill:#95a5a6,color:#fff
+    style PC fill:#f39c12,color:#fff
     style PD fill:#95a5a6,color:#fff
 ```
 
@@ -352,7 +361,7 @@ flowchart LR
 | Phase B: Optimization & Throughput | :white_check_mark: | ~87k tok/s compiled, 1.13x convergence gap |
 | Phase B.5: Structural Advantages | :white_check_mark: | Tiered banks, early exit, sparse compute path |
 | Ternary Quantization (BitNet b1.58) | :white_check_mark: | {-1,0,1} weights, 1.10x compiled throughput ratio |
-| Phase C: SSM/MLA Integration | :hourglass: | Long context, memory efficiency |
+| Phase C: Attention Experiments | :construction: | Gated recurrence beats softmax MHA by 3% (PPL 86 vs 99) |
 | Phase D: Reasoning Integration | :hourglass: | R1-style inference-time reasoning |
 
 ---

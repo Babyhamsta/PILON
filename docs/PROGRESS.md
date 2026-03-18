@@ -390,6 +390,67 @@ torch.compile closes the eager gap (1.88x) almost entirely (1.10x compiled).
 
 ---
 
+## Phase C: Attention Experiments
+
+**Goal:** Find an attention mechanism that complements PILON's compositional FFN.
+
+### C1: Compositional MHA (Shared Q/K/V Projections)
+
+Replace `nn.Linear` Q/K/V projections with PILON-style compositional primitive banks. Attention mechanism (softmax SDPA) unchanged.
+
+| Metric | C1 (Compositional MHA) | C0 (Standard MHA) |
+|--------|:-:|:-:|
+| Val Loss | 4.870 | 4.596 |
+| Val PPL | 130.3 | 99.1 |
+| vs C0 | 1.06x loss | — |
+| Throughput | ~73k tok/s | ~34k tok/s |
+| Duration | 2.04 hrs | 4.4 hrs |
+
+**Finding:** Q/K/V projections (512→512) are too small for primitive sharing to help. 6% worse in loss. Faster than C0 due to torch.compile optimizing the compositional path.
+
+### C2: Gated Linear Recurrence (Griffin-style)
+
+Replace softmax attention entirely with O(T) gated linear recurrence. Uses `flash-linear-attention` library's Triton GLA kernel for numerically stable forward/backward.
+
+| Metric | C2 (Gated Recurrence) | C0 (Standard MHA) | Dense |
+|--------|:-:|:-:|:-:|
+| Val Loss | **4.455** | 4.596 | 4.165 |
+| Val PPL | **85.9** | 99.1 | 64.4 |
+| vs C0 | **0.97x loss** | — | — |
+| vs Dense | 1.07x loss | 1.10x loss | — |
+| Throughput | ~35k tok/s | ~34k tok/s | ~42k tok/s |
+| Duration | 3.80 hrs | 4.4 hrs | 3.4 hrs |
+
+**Finding:** Gated recurrence **outperforms standard softmax attention** by 3% in loss (13% in PPL) when paired with PILON's ternary FFN. O(T) complexity vs O(T²), no KV cache needed. This is the best PILON variant to date.
+
+**Key implementation details:**
+- Griffin-style log-space decay: `log_decay = -softplus(w)` for stable gradients
+- `flash-linear-attention` GLA Triton kernel handles chunked scan numerics
+- RMSNorm on recurrence output stabilizes interaction with ternary FFN
+- Compatible with torch.compile (GLA kernel runs as custom op)
+
+### C2 Stability Investigation
+
+Extensive debugging revealed that naive implementations of gated linear recurrence are numerically unstable with ternary quantization:
+
+1. **Forward overflow:** Cumulative log-decay over T=512 steps causes `exp()` to overflow float32. Fix: chunked scan with bounded exponents per chunk.
+2. **Backward gradient explosion:** Ternary STE produces occasional gradient spikes that amplify through the multiplicative recurrence chain. Fix: Griffin log-space gating (additive gradients instead of multiplicative).
+3. **Data-dependent NaN:** Certain real data distributions trigger edge cases not caught by fixed-batch tests. Fix: `flash-linear-attention` library's production Triton kernels handle all numerical edge cases correctly.
+
+### Phase C Run Matrix
+
+| Run | Attention | FFN | Val Loss | Val PPL | Status |
+|-----|-----------|-----|:-:|:-:|--------|
+| C0 | Standard MHA | PILON Ternary | 4.596 | 99.1 | Complete (prior run) |
+| C1 | Compositional MHA | PILON Ternary | 4.870 | 130.3 | Complete |
+| **C2** | **Gated Recurrence** | **PILON Ternary** | **4.455** | **85.9** | **Complete — best result** |
+| C3 | Compositional Gated Rec | PILON Ternary | — | — | Pending |
+| C4 | Hybrid (rec + MHA) | PILON Ternary | — | — | Pending |
+
+> Source: `outputs/48m_phase_c1_comp_attn/`, `outputs/48m_phase_c2_gated_rec/`
+
+---
+
 ## Current Status
 
 ### Completed
@@ -405,11 +466,14 @@ torch.compile closes the eager gap (1.88x) almost entirely (1.10x compiled).
 - [x] Phase B.5e: Benchmarking suite
 - [x] Ternary quantization (500M token crossover complete, 1.10x loss ratio)
 - [x] fp16 PILON crossover (500M tokens, 1.13x loss ratio — ternary is better)
+- [x] Phase C1: Compositional attention (shared Q/K/V projections — 6% worse than standard)
+- [x] Phase C2: Gated linear recurrence (beats standard MHA by 3% — best PILON variant)
 
 ### Pending
 
+- [ ] Phase C3/C4: Compositional recurrence and hybrid attention experiments
 - [ ] Run 360M ternary crossover experiment
-- [ ] Phase C: SSM/MLA integration for long context
+- [ ] Scale C2 (gated recurrence) to 360M
 - [ ] Phase D: Reasoning integration (R1-style)
 
 ---
@@ -431,6 +495,9 @@ torch.compile closes the eager gap (1.88x) almost entirely (1.10x compiled).
 | Jan 31 | SFT validation complete | 1 epoch, decent output quality |
 | Feb 23 | Phase B.5 structural advantages complete | Tiered banks, early exit, compute path fix |
 | Mar 5 | Ternary quantization complete | 1.10x loss ratio, healthy training metrics |
+| Mar 17 | Phase C1 compositional MHA complete | 6% worse than standard — Q/K/V too small for sharing |
+| Mar 18 | Phase C2 gated recurrence complete | **Beats standard MHA by 3%** — best PILON variant |
+| Mar 18 | Adopted flash-linear-attention for GLA kernel | Solves ternary + recurrence NaN instability |
 
 ---
 
@@ -443,11 +510,15 @@ torch.compile closes the eager gap (1.88x) almost entirely (1.10x compiled).
 3. **Is the gap ceiling or convergence?** — Convergence (loss still improving at run end)
 4. **Does ternary quantization work with PILON?** — Yes: 1.10x loss ratio, stable training
 
+5. **Can attention benefit from PILON-style sharing?** — No for projections (C1), but recurrence works better than softmax (C2)
+6. **Does gated recurrence work with ternary quantization?** — Yes, with flash-linear-attention GLA kernel. Naive PyTorch implementations produce NaN due to forward overflow and backward gradient explosion.
+
 ### Current
 
-5. **Does PILON scale to 360M?** — Scripts ready, awaiting run
-6. **Phase C prerequisites** — SSM/MLA integration readiness?
+7. **Does PILON scale to 360M?** — Scripts ready, awaiting run
+8. **Does C2's recurrence advantage scale to 360M?** — Key question for next phase
+9. **Can compositional gated recurrence (C3) further improve C2?** — Pending
 
 ---
 
-*Last updated: March 5, 2026*
+*Last updated: March 18, 2026*
