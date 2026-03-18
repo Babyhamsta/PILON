@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -824,6 +825,73 @@ def unwrap_model(model: nn.Module) -> nn.Module:
         return model.module
     return model
 
+
+def ensure_msvc_env() -> bool:
+    """
+    Ensure MSVC INCLUDE/LIB environment variables are set for torch.compile
+    C++ code generation (shape guards, cpp wrappers).
+
+    On Windows, cl.exe may be on PATH but without the include/lib paths that
+    vcvars64.bat would normally set. This function auto-detects and sets them.
+
+    Returns True if environment was configured, False if MSVC was not found.
+    """
+    # Skip if INCLUDE is already set (user ran vcvars64 or this was already called)
+    if os.environ.get("INCLUDE"):
+        return True
+
+    import shutil
+    cl_path = shutil.which("cl")
+    if cl_path is None:
+        return False
+
+    # Discover MSVC version from cl.exe path
+    # Expected: .../MSVC/<version>/bin/Hostx64/x64/cl.exe
+    cl_path = cl_path.replace("\\", "/")
+    msvc_base = None
+    parts = cl_path.split("/")
+    for i, part in enumerate(parts):
+        if part == "MSVC" and i + 1 < len(parts):
+            msvc_base = "/".join(parts[:i + 2])
+            break
+
+    if msvc_base is None:
+        return False
+
+    # Find Windows SDK
+    sdk_base = "C:/Program Files (x86)/Windows Kits/10"
+    sdk_ver = None
+    sdk_include = os.path.join(sdk_base, "Include")
+    if os.path.isdir(sdk_include):
+        versions = sorted(os.listdir(sdk_include), reverse=True)
+        for v in versions:
+            if os.path.isdir(os.path.join(sdk_include, v, "ucrt")):
+                sdk_ver = v
+                break
+
+    if sdk_ver is None:
+        return False
+
+    # Set INCLUDE
+    include_paths = [
+        f"{msvc_base}/include",
+        f"{sdk_base}/Include/{sdk_ver}/ucrt",
+        f"{sdk_base}/Include/{sdk_ver}/shared",
+        f"{sdk_base}/Include/{sdk_ver}/um",
+    ]
+    os.environ["INCLUDE"] = ";".join(include_paths)
+
+    # Set LIB
+    lib_paths = [
+        f"{msvc_base}/lib/x64",
+        f"{sdk_base}/Lib/{sdk_ver}/ucrt/x64",
+        f"{sdk_base}/Lib/{sdk_ver}/um/x64",
+    ]
+    os.environ["LIB"] = ";".join(lib_paths)
+
+    return True
+
+
 # ---------------------------
 # Training loop
 # ---------------------------
@@ -924,6 +992,22 @@ def train_v2(args: argparse.Namespace) -> None:
             model_config.primitive_config.use_squared_relu = True
         if getattr(args, 'activation_bits', None) is not None:
             model_config.primitive_config.activation_bits = args.activation_bits
+
+    # Phase C: Attention variant
+    if hasattr(args, 'attention_type') and args.attention_type != "standard_mha":
+        # Normalize aliases to canonical names
+        attn_type = args.attention_type
+        if attn_type == "compositional_gated_recurrence":
+            attn_type = "compositional_recurrence"
+        elif attn_type == "hybrid_recurrent_mha":
+            attn_type = "hybrid"
+        model_config.attention_type = attn_type
+    if hasattr(args, 'n_attn_primitives') and args.n_attn_primitives is not None:
+        model_config.n_attn_primitives = args.n_attn_primitives
+    if hasattr(args, 'attn_rank') and args.attn_rank is not None:
+        model_config.attn_rank = args.attn_rank
+    if hasattr(args, 'attn_top_k') and args.attn_top_k is not None:
+        model_config.attn_top_k = args.attn_top_k
 
     # Override sequence length if specified
     if args.seq_len is not None:
@@ -1126,9 +1210,20 @@ def train_v2(args: argparse.Namespace) -> None:
 
     if args.compile:
         try:
+            # Ensure MSVC environment is set for C++ guard compilation on Windows
+            if os.name == "nt":
+                if ensure_msvc_env():
+                    logger.info(f"MSVC environment configured: INCLUDE={os.environ.get('INCLUDE', '')[:80]}...")
+                else:
+                    logger.warning("Could not auto-configure MSVC environment. "
+                                   "torch.compile C++ guards may fail. "
+                                   "Run from a VS Developer Command Prompt or set INCLUDE/LIB manually.")
             # Allow scalar outputs (e.g. scale.item() in quantization) to be
             # captured in the graph instead of causing graph breaks.
             torch._dynamo.config.capture_scalar_outputs = True
+            # Treat integer nn.Module attributes (e.g. runtime_step) as dynamic
+            # so they don't trigger recompilation every step.
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
             model = torch.compile(model)
             logger.info("Enabled torch.compile for model")
         except Exception as exc:
@@ -1194,7 +1289,7 @@ def train_v2(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
         if "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"])
+            unwrap_model(model).load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if use_scaler and ckpt.get("scaler_state_dict") is not None:
@@ -1381,12 +1476,25 @@ def train_v2(args: argparse.Namespace) -> None:
                     if freeze_primitives_phase2:
                         set_primitive_requires_grad(raw_model, False)
                     set_composition_requires_grad(raw_model, True)
-                torch._dynamo.reset()
-                torch._dynamo.config.capture_scalar_outputs = True
-                model = torch.compile(raw_model)
-                logger.info(f"Phase {prev_phase}->{phase}: recompiled model "
-                            f"(primitives_grad={not (phase >= 2 and freeze_primitives_phase2)}, "
-                            f"composition_grad={phase >= 2})")
+
+                # Log frozen/trainable param counts for debugging
+                n_trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+                n_frozen = sum(p.numel() for p in raw_model.parameters() if not p.requires_grad)
+                logger.info(f"Phase {prev_phase}->{phase}: trainable={n_trainable:,} frozen={n_frozen:,}")
+
+                try:
+                    torch._dynamo.reset()
+                    torch._dynamo.config.capture_scalar_outputs = True
+                    torch._dynamo.config.allow_unspec_int_on_nn_module = True
+                    if os.name == "nt":
+                        ensure_msvc_env()
+                    model = torch.compile(raw_model)
+                    logger.info(f"Phase {prev_phase}->{phase}: recompiled model OK")
+                except Exception as exc:
+                    logger.error(f"Phase {prev_phase}->{phase}: recompile FAILED: {exc}")
+                    logger.info("Falling back to eager mode for remaining training")
+                    model = raw_model
+                    recompile_phases = False
             prev_phase = phase
 
             cache_frozen_primitives = phase >= 2 and freeze_primitives_phase2
@@ -1911,6 +2019,19 @@ def main() -> None:
                         help="Auxiliary load-balancing weight for MoE")
     parser.add_argument("--no-moe-load-balancing", action="store_true",
                         help="Disable MoE load balancing loss")
+    # Phase C: Attention variants
+    parser.add_argument("--attention-type", type=str, default="standard_mha",
+                        choices=["standard_mha", "compositional_mha", "gated_recurrence",
+                                 "compositional_recurrence", "compositional_gated_recurrence",
+                                 "hybrid", "hybrid_recurrent_mha"],
+                        help="Attention mechanism type")
+    parser.add_argument("--n-attn-primitives", type=int, default=16,
+                        help="Number of attention primitives (compositional attention)")
+    parser.add_argument("--attn-rank", type=int, default=32,
+                        help="Rank for attention primitive banks")
+    parser.add_argument("--attn-top-k", type=int, default=4,
+                        help="Top-k for attention composition")
+
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     parser.add_argument("--recompile-phases", action="store_true",
                         help="Recompile model at phase boundaries (requires --compile). "

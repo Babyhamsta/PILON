@@ -16,6 +16,7 @@ from .config import ModelConfig, PrimitiveConfig, MoEConfig
 from .primitives import BandPrimitiveBanks, LayerCompositionWeights
 from .ffn import create_ffn, CompositionalFFN, MoECompositionalFFN
 from .early_exit import ExitGate
+from .attention import create_attention, AttentionPrimitiveBanks
 
 
 class RMSNorm(nn.Module):
@@ -240,6 +241,13 @@ class TransformerBlock(nn.Module):
         exit_threshold: float = 0.5,
         # Ternary stability
         use_subln: bool = False,
+        # Phase C: Attention variant
+        attention_type: str = "standard_mha",
+        attn_primitive_banks: Optional[AttentionPrimitiveBanks] = None,
+        n_attn_primitives: int = 16,
+        attn_top_k: int = 4,
+        n_layers: int = 8,
+        bands: Optional[List[Dict]] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -259,13 +267,20 @@ class TransformerBlock(nn.Module):
             self.norm1 = nn.LayerNorm(d_model)
             self.norm2 = nn.LayerNorm(d_model)
 
-        # Attention
-        self.attention = MultiHeadAttention(
+        # Attention (Phase C: use factory for variant selection)
+        self.attention = create_attention(
+            attention_type=attention_type,
             d_model=d_model,
             n_heads=n_heads,
             d_head=d_head,
             dropout=dropout,
-            max_seq_len=max_seq_len
+            max_seq_len=max_seq_len,
+            attn_primitive_banks=attn_primitive_banks,
+            n_attn_primitives=n_attn_primitives,
+            attn_top_k=attn_top_k,
+            layer_idx=layer_idx,
+            n_layers=n_layers,
+            bands=bands,
         )
 
         # FFN (compositional, MoE compositional, or standard)
@@ -472,6 +487,31 @@ class PILONTransformer(nn.Module):
                 activation_bits=pc.activation_bits,
             )
 
+        # Track whether attention uses recurrence (affects cache format)
+        self._attn_uses_recurrence = config.attention_type in (
+            "gated_recurrence", "compositional_recurrence", "hybrid"
+        )
+
+        # Create attention primitive banks if using compositional attention
+        self.attn_primitive_banks = None
+        needs_attn_banks = config.attention_type in ("compositional_mha", "compositional_recurrence")
+        if needs_attn_banks:
+            pc = config.primitive_config
+            bands = [{"name": b.name, "layers": b.layers} for b in pc.bands]
+            self.attn_primitive_banks = AttentionPrimitiveBanks(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                d_head=config.d_head,
+                n_primitives=config.n_attn_primitives,
+                rank=config.attn_rank,
+                bands=bands,
+                ternary=pc.ternary_primitives,
+                activation_bits=pc.activation_bits,
+            )
+
+        # Band config dicts for attention factory (always compute from primitive_config)
+        attn_bands = [{"name": b.name, "layers": b.layers} for b in config.primitive_config.bands]
+
         # Get MoE config if present
         moe_config = None
         if config.ffn_type == "compositional" and config.primitive_config.moe_config is not None:
@@ -514,6 +554,13 @@ class PILONTransformer(nn.Module):
                 enable_early_exit=config.enable_early_exit,
                 exit_threshold=config.exit_threshold,
                 use_subln=use_subln,
+                # Phase C attention params
+                attention_type=config.attention_type,
+                attn_primitive_banks=self.attn_primitive_banks,
+                n_attn_primitives=config.n_attn_primitives,
+                attn_top_k=config.attn_top_k,
+                n_layers=config.n_layers,
+                bands=attn_bands,
             )
             for i in range(config.n_layers)
         ])
@@ -540,8 +587,9 @@ class PILONTransformer(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-        use_cache: bool = False
+        past_key_values: Optional[List] = None,
+        use_cache: bool = False,
+        past_len_override: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
@@ -550,6 +598,9 @@ class PILONTransformer(nn.Module):
             input_ids: Token IDs (batch, seq)
             attention_mask: Optional attention mask
             labels: Optional labels for loss computation
+            past_key_values: Cached states from prior forward pass
+            use_cache: Whether to return cached states
+            past_len_override: Explicit position offset for recurrence models
 
         Returns:
             Dictionary with 'logits', optionally 'loss', and 'aux_loss' (for MoE)
@@ -558,8 +609,14 @@ class PILONTransformer(nn.Module):
 
         # Get embeddings (offset positions if using KV cache)
         past_len = 0
-        if past_key_values is not None and len(past_key_values) > 0:
-            past_len = past_key_values[0][0].size(2)
+        if past_len_override is not None:
+            past_len = past_len_override
+        elif past_key_values is not None and len(past_key_values) > 0:
+            first_cache = past_key_values[0]
+            if isinstance(first_cache, tuple):
+                # MHA cache: (K, V) where K is (B, H, T, D)
+                past_len = first_cache[0].size(2)
+            # Recurrence cache is a plain Tensor — past_len comes from override
         positions = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
         x = self.dropout(x)
@@ -692,6 +749,9 @@ class PILONTransformer(nn.Module):
 
         autocast_ctx = torch.autocast("cuda", dtype=amp_dtype) if amp_dtype is not None else nullcontext()
 
+        uses_recurrence = self._attn_uses_recurrence
+        recurrence_step = 0  # Track position offset for recurrence models
+
         with torch.inference_mode(), autocast_ctx:
             for _ in range(max_new_tokens):
                 # Truncate to max_seq_len if needed
@@ -700,22 +760,27 @@ class PILONTransformer(nn.Module):
                     if attention_mask is not None:
                         attention_mask = attention_mask[:, -self.config.max_seq_len:]
                     past_key_values = None
+                    recurrence_step = 0
 
                 if past_key_values is None:
                     idx_cond = input_ids
                     attn = attention_mask
+                    past_len_override = None
                 else:
                     idx_cond = input_ids[:, -1:]
                     attn = None
+                    past_len_override = recurrence_step if uses_recurrence else None
 
                 outputs = self.forward(
                     idx_cond,
                     attention_mask=attn,
                     past_key_values=past_key_values,
-                    use_cache=True
+                    use_cache=True,
+                    past_len_override=past_len_override,
                 )
                 logits = outputs["logits"][:, -1, :]  # Get last token logits
                 past_key_values = outputs.get("past_key_values", None)
+                recurrence_step = input_ids.size(1)  # Track total tokens for position offset
 
                 # Apply temperature (skip if 0, will use argmax below)
                 if temperature > 0 and temperature != 1.0:
@@ -900,6 +965,11 @@ class PILONTransformer(nn.Module):
         if self.primitive_banks is not None:
             counts["primitive_banks"] = sum(
                 p.numel() for p in self.primitive_banks.parameters()
+            )
+
+        if self.attn_primitive_banks is not None:
+            counts["attn_primitive_banks"] = sum(
+                p.numel() for p in self.attn_primitive_banks.parameters()
             )
 
         # Add MoE-specific parameter counts

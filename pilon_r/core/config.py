@@ -111,10 +111,16 @@ class ModelConfig:
     vocab_size: int = 50257  # GPT-2 tokenizer
     max_seq_len: int = 512
 
-    # Attention (standard)
-    attention_type: str = "standard_mha"
+    # Attention
+    attention_type: str = "standard_mha"  # "standard_mha", "compositional_mha",
+                                          # "gated_recurrence", "compositional_recurrence", "hybrid"
     pos_encoding: str = "learned"
     dropout: float = 0.1
+
+    # Compositional attention config (only used when attention_type != "standard_mha")
+    n_attn_primitives: int = 16
+    attn_rank: int = 32
+    attn_top_k: int = 4
 
     # Normalization
     norm_type: str = "rmsnorm"
