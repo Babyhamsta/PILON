@@ -112,8 +112,8 @@ class ModelConfig:
     max_seq_len: int = 512
 
     # Attention
-    attention_type: str = "standard_mha"  # "standard_mha", "compositional_mha",
-                                          # "gated_recurrence", "compositional_recurrence", "hybrid"
+    attention_type: str = "gated_recurrence"  # "standard_mha", "compositional_mha",
+                                              # "gated_recurrence", "compositional_recurrence", "hybrid"
     pos_encoding: str = "learned"
     dropout: float = 0.1
 

@@ -2020,7 +2020,7 @@ def main() -> None:
     parser.add_argument("--no-moe-load-balancing", action="store_true",
                         help="Disable MoE load balancing loss")
     # Phase C: Attention variants
-    parser.add_argument("--attention-type", type=str, default="standard_mha",
+    parser.add_argument("--attention-type", type=str, default="gated_recurrence",
                         choices=["standard_mha", "compositional_mha", "gated_recurrence",
                                  "compositional_recurrence", "compositional_gated_recurrence",
                                  "hybrid", "hybrid_recurrent_mha"],
