@@ -2074,10 +2074,11 @@ def main() -> None:
                         help="Enable SubLN normalization for ternary stability")
     parser.add_argument("--use-squared-relu", action="store_true",
                         help="Use squared ReLU activation (sparser, pairs with ternary)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     args = parser.parse_args()
     args.tf32 = not args.no_tf32
-    set_seed(42)
+    set_seed(args.seed)
     train_v2(args)
 
 
