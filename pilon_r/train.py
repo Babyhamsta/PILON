@@ -1484,6 +1484,7 @@ def train_v2(args: argparse.Namespace) -> None:
 
                 try:
                     torch._dynamo.reset()
+                    torch.cuda.empty_cache()  # Free fragmented VRAM before recompile
                     torch._dynamo.config.capture_scalar_outputs = True
                     torch._dynamo.config.allow_unspec_int_on_nn_module = True
                     if os.name == "nt":
