@@ -64,9 +64,11 @@ else
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_dense_seed42 \
-        --seed 42 \
+        --seed 42 --save-every 0 \
         ${DATA_FLAGS}
 fi
+# Clean intermediate checkpoints
+rm -f outputs/360m_dense_seed42/checkpoint_step_*.pt 2>/dev/null
 
 # ==========================================
 # Run 2: Dense 360M, seed=123
@@ -88,9 +90,11 @@ else
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_dense_seed123 \
-        --seed 123 \
+        --seed 123 --save-every 0 \
         ${DATA_FLAGS}
 fi
+# Clean intermediate checkpoints
+rm -f outputs/360m_dense_seed123/checkpoint_step_*.pt 2>/dev/null
 
 # ==========================================
 # Run 3: PILON C2 (GLA + ternary) 360M, seed=42
@@ -117,9 +121,11 @@ else
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_pilon_c2_seed42 \
-        --seed 42 \
+        --seed 42 --save-every 0 \
         --log-comp-stats
 fi
+# Clean intermediate checkpoints
+rm -f outputs/360m_pilon_c2_seed42/checkpoint_step_*.pt 2>/dev/null
 
 # ==========================================
 # Run 4: PILON C2 (GLA + ternary) 360M, seed=123
@@ -146,9 +152,11 @@ else
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_pilon_c2_seed123 \
-        --seed 123 \
+        --seed 123 --save-every 0 \
         --log-comp-stats
 fi
+# Clean intermediate checkpoints
+rm -f outputs/360m_pilon_c2_seed123/checkpoint_step_*.pt 2>/dev/null
 
 echo ""
 echo "=========================================="
