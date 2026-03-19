@@ -1,71 +1,43 @@
 #!/bin/bash
 # PILON-R 360M Cloud Training Script
 #
-# Run on A100 40GB (Vast.ai, Lambda, etc.)
+# Run on A800 80GB / A100 (Vast.ai, Lambda, etc.)
 # Trains Dense baseline + PILON C2 (gated recurrence), 2 seeds each.
 #
 # Setup:
 #   git clone https://github.com/Babyhamsta/PILON.git && cd PILON
+#   git checkout phase_c_experiments
 #   pip install -r requirements.txt
 #   pip install flash-linear-attention
 #   bash scripts/run_360m_cloud.sh
 #
-# Estimated time on A100 40GB: ~60-80 hours total (4 runs)
-# Estimated cost at $0.472/hr: ~$30-40
+# Override batch size: BATCH=16 bash scripts/run_360m_cloud.sh
+#
+# To find optimal batch for your GPU first:
+#   PYTHONPATH=. python scripts/auto_batch.py --model-size 360m --ffn-type standard --no-ternary
+#   PYTHONPATH=. python scripts/auto_batch.py --model-size 360m --ffn-type compositional
 
 set -e
 
-TOTAL_TOKENS=1000000000  # 1B tokens
-SEQ_LEN=2048
-DATASET="HuggingFaceFW/fineweb-edu"
+# Configurable via environment or defaults
+BATCH=${BATCH:-12}
+GRAD_ACCUM=${GRAD_ACCUM:-3}
+SEQ_LEN=${SEQ_LEN:-2048}
+TOTAL_TOKENS=${TOTAL_TOKENS:-1000000000}
+DATASET=${DATASET:-"HuggingFaceFW/fineweb-edu"}
 
-# Auto-detect batch size for this GPU
+# Ensure PYTHONPATH includes repo root
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(pwd)"
+
 echo "=========================================="
-echo "Auto-detecting optimal batch size..."
-echo "=========================================="
-
-# --- Step 1: Find batch size for Dense 360M ---
-echo ""
-echo "Probing Dense 360M..."
-DENSE_BATCH=$(python scripts/auto_batch.py \
-    --model-size 360m \
-    --ffn-type standard \
-    --attention-type standard_mha \
-    --seq-len ${SEQ_LEN} \
-    --no-ternary 2>&1 | grep "batch-size" | awk '{print $NF}')
-
-if [ -z "$DENSE_BATCH" ]; then
-    echo "Auto-detect failed for Dense, defaulting to batch=2"
-    DENSE_BATCH=2
-fi
-
-# --- Step 2: Find batch size for PILON C2 ---
-echo ""
-echo "Probing PILON C2 (GLA + ternary)..."
-PILON_BATCH=$(python scripts/auto_batch.py \
-    --model-size 360m \
-    --ffn-type compositional \
-    --attention-type gated_recurrence \
-    --seq-len ${SEQ_LEN} 2>&1 | grep "batch-size" | awk '{print $NF}')
-
-if [ -z "$PILON_BATCH" ]; then
-    echo "Auto-detect failed for PILON, defaulting to batch=2"
-    PILON_BATCH=2
-fi
-
-# Compute grad_accum to target ~64k tokens per effective batch
-DENSE_ACCUM=$((65536 / (DENSE_BATCH * SEQ_LEN)))
-PILON_ACCUM=$((65536 / (PILON_BATCH * SEQ_LEN)))
-[ "$DENSE_ACCUM" -lt 1 ] && DENSE_ACCUM=1
-[ "$PILON_ACCUM" -lt 1 ] && PILON_ACCUM=1
-
-echo ""
-echo "=========================================="
-echo "Configuration:"
-echo "  Dense:  batch=${DENSE_BATCH}, grad_accum=${DENSE_ACCUM}, seq=${SEQ_LEN}"
-echo "  PILON:  batch=${PILON_BATCH}, grad_accum=${PILON_ACCUM}, seq=${SEQ_LEN}"
-echo "  Tokens: ${TOTAL_TOKENS}"
+echo "PILON-R 360M Cloud Training"
+echo "  Batch: ${BATCH}"
+echo "  Grad accum: ${GRAD_ACCUM}"
+echo "  Seq len: ${SEQ_LEN}"
+echo "  Effective batch: $((BATCH * GRAD_ACCUM * SEQ_LEN)) tokens/step"
+echo "  Total tokens: ${TOTAL_TOKENS}"
 echo "  Dataset: ${DATASET}"
+echo "  GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null || echo 'unknown')"
 echo "=========================================="
 
 # Shared flags
@@ -87,8 +59,8 @@ else
         --attention-type standard_mha \
         --compile \
         --total-tokens ${TOTAL_TOKENS} \
-        --batch-size ${DENSE_BATCH} \
-        --grad-accum ${DENSE_ACCUM} \
+        --batch-size ${BATCH} \
+        --grad-accum ${GRAD_ACCUM} \
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_dense_seed42 \
@@ -111,8 +83,8 @@ else
         --attention-type standard_mha \
         --compile \
         --total-tokens ${TOTAL_TOKENS} \
-        --batch-size ${DENSE_BATCH} \
-        --grad-accum ${DENSE_ACCUM} \
+        --batch-size ${BATCH} \
+        --grad-accum ${GRAD_ACCUM} \
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_dense_seed123 \
@@ -140,8 +112,8 @@ else
         --phase1-top-k 8 \
         ${PILON_FLAGS} \
         --total-tokens ${TOTAL_TOKENS} \
-        --batch-size ${PILON_BATCH} \
-        --grad-accum ${PILON_ACCUM} \
+        --batch-size ${BATCH} \
+        --grad-accum ${GRAD_ACCUM} \
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_pilon_c2_seed42 \
@@ -169,8 +141,8 @@ else
         --phase1-top-k 8 \
         ${PILON_FLAGS} \
         --total-tokens ${TOTAL_TOKENS} \
-        --batch-size ${PILON_BATCH} \
-        --grad-accum ${PILON_ACCUM} \
+        --batch-size ${BATCH} \
+        --grad-accum ${GRAD_ACCUM} \
         --seq-len ${SEQ_LEN} \
         --dataset ${DATASET} \
         --output-dir outputs/360m_pilon_c2_seed123 \
