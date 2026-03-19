@@ -414,14 +414,25 @@ Replace softmax attention entirely with O(T) gated linear recurrence. Uses `flas
 
 | Metric | C2 (Gated Recurrence) | C0 (Standard MHA) | Dense |
 |--------|:-:|:-:|:-:|
-| Val Loss | 4.455 | 4.596 | 4.165 |
-| Val PPL | 85.9 | 99.1 | 64.4 |
-| Loss ratio vs Dense | 1.07x | 1.10x | — |
-| PPL ratio vs Dense | 1.33x | 1.54x | — |
+| Val Loss (3-seed mean ± std) | **4.403 ± 0.047** | 4.596 | 4.165 |
+| Val PPL (3-seed mean ± std) | **81.7 ± 3.7** | 99.1 | 64.4 |
+| Loss ratio vs Dense | 1.057x | 1.10x | — |
+| PPL ratio vs Dense | 1.27x | 1.54x | — |
 | Throughput | ~35k tok/s | ~34k tok/s | ~42k tok/s |
-| Duration | 3.80 hrs | 4.4 hrs | 3.4 hrs |
+| Duration | ~3.5 hrs | 4.4 hrs | 3.4 hrs |
 
-**Finding:** PILON's compositional FFN appears to pair better with a smooth state-update recurrence than with standard softmax attention. C2 achieves 1.07x loss / 1.33x PPL vs dense, compared to C0's 1.10x / 1.54x. The mechanism is not yet understood — gradient flow differences (observed in HoloTern experiments showing Q/K gradient starvation in softmax attention) are a plausible hypothesis but unproven.
+**3-seed validation** (seeds 42, 123, 7):
+
+| Seed | Val Loss | Val PPL | Loss Ratio | PPL Ratio |
+|------|:-:|:-:|:-:|:-:|
+| 42 | 4.455 | 85.9 | 1.070x | 1.33x |
+| 123 | 4.368 | 78.9 | 1.049x | 1.22x |
+| 7 | 4.386 | 80.3 | 1.053x | 1.25x |
+| **Mean** | **4.403** | **81.7** | **1.057x** | **1.27x** |
+
+The gain over standard MHA is consistent across seeds: mean 4.2% improvement in loss, 17.6% in PPL.
+
+**Finding:** PILON's compositional FFN appears to pair better with a smooth state-update recurrence than with standard softmax attention. The mechanism is not yet understood — gradient flow differences (observed in HoloTern experiments showing Q/K gradient starvation in softmax attention) are a plausible hypothesis but unproven.
 
 The practical advantage of gated recurrence is **zero KV cache** — O(T) memory with fixed-size recurrent state for generation. Wall-clock throughput is comparable to standard MHA (~35k vs ~34k tok/s).
 
@@ -464,7 +475,7 @@ C4 would combine recurrence in early/middle layers with MHA in late layers. Give
 |-----|-----------|-----|:-:|:-:|--------|
 | C0 | Standard MHA | PILON Ternary | 4.596 | 99.1 | Complete (prior run) |
 | C1 | Compositional MHA | PILON Ternary | 4.870 | 130.3 | Complete — sharing hurts |
-| C2 | Gated Recurrence | PILON Ternary | 4.455 | 85.9 | Complete — best variant (1.07x / 1.33x vs dense) |
+| C2 | Gated Recurrence | PILON Ternary | 4.403 ± 0.047 | 81.7 ± 3.7 | 3-seed validated (1.057x / 1.27x vs dense) |
 | C3 | Compositional Gated Rec | PILON Ternary | ~4.95* | ~141* | Stopped at step 3,500 — neutral vs C2, slower |
 | C4 | Hybrid (rec + MHA) | PILON Ternary | — | — | Skipped |
 

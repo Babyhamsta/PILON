@@ -123,16 +123,18 @@ All runs trained to 15,255 steps on identical data with batch=8, grad_accum=8, s
 
 | Model | Attention | Final Val Loss | Val PPL | Loss Ratio vs Dense | PPL Ratio vs Dense |
 |-------|-----------|:-------------:|:-------:|:-------------------:|:------------------:|
-| Dense-48M | Standard MHA | 4.1654 | 64.42 | 1.00x | 1.00x |
-| PILON + Gated Recurrence | GLA (O(T)) | 4.4550 | 85.94 | 1.07x | 1.33x |
-| PILON Ternary + SubLN + SqReLU | Standard MHA | 4.5958 | 99.07 | 1.10x | 1.54x |
-| PILON Ternary + SubLN | Standard MHA | 4.6473 | 104.30 | 1.12x | 1.62x |
-| PILON fp16 | Standard MHA | 4.6896 | 108.81 | 1.13x | 1.69x |
-| PILON + Compositional MHA | Comp. MHA | 4.8699 | 130.31 | 1.17x | 2.02x |
+| Dense-48M | Standard MHA | 4.165 | 64.4 | 1.00x | 1.00x |
+| **PILON + Gated Recurrence** | **GLA (O(T))** | **4.403 ± 0.047** | **81.7 ± 3.7** | **1.057x** | **1.27x** |
+| PILON Ternary + SubLN + SqReLU | Standard MHA | 4.596 | 99.1 | 1.10x | 1.54x |
+| PILON Ternary + SubLN | Standard MHA | 4.647 | 104.3 | 1.12x | 1.62x |
+| PILON fp16 | Standard MHA | 4.690 | 108.8 | 1.13x | 1.69x |
+| PILON + Compositional MHA | Comp. MHA | 4.870 | 130.3 | 1.17x | 2.02x |
 
-- PILON's compositional FFN appears to pair better with a smooth state-update recurrence than with standard softmax attention. The gated recurrence variant (1.07x loss / 1.33x PPL vs dense) outperforms standard MHA (1.10x / 1.54x) at matched token budgets. The mechanism behind this is not yet understood — gradient flow differences (observed in prior HoloTern experiments) are a plausible hypothesis but unproven.
+> PILON + Gated Recurrence results are 3-seed validated (seeds 42, 123, 7). All other rows are single-seed (seed=42).
+
+- PILON's compositional FFN appears to pair better with a smooth state-update recurrence than with standard softmax attention. The gated recurrence variant (1.057x loss / 1.27x PPL vs dense, 3-seed mean) outperforms standard MHA (1.10x / 1.54x) at matched token budgets. The mechanism behind this is not yet understood — gradient flow differences (observed in prior HoloTern experiments) are a plausible hypothesis but unproven.
 - The recurrence variant's practical advantage is **zero KV cache** — O(T) memory vs O(T²) for attention, with fixed-size recurrent state for generation. Wall-clock throughput is comparable (~35k vs ~34k tok/s).
-- Training is fully stable across all configs: no NaN, no divergence, no primitive collapse
+- Training is fully stable across all configs and seeds: no NaN, no divergence, no primitive collapse
 - The gap vs dense is convergence speed, not a ceiling — loss continues improving with more tokens
 
 ### Throughput (RTX 4070, batch=8, seq=512, fwd+bwd)
@@ -360,7 +362,7 @@ flowchart LR
 | Phase B: Optimization & Throughput | :white_check_mark: | ~87k tok/s compiled, 1.13x convergence gap |
 | Phase B.5: Structural Advantages | :white_check_mark: | Tiered banks, early exit, sparse compute path |
 | Ternary Quantization (BitNet b1.58) | :white_check_mark: | {-1,0,1} weights, 1.10x compiled throughput ratio |
-| Phase C: Attention Experiments | :construction: | Gated recurrence (1.07x/1.33x) vs standard MHA (1.10x/1.54x) — recurrence pairs better with PILON FFN |
+| Phase C: Attention Experiments | :white_check_mark: | Gated recurrence (1.057x/1.27x, 3-seed) vs standard MHA (1.10x/1.54x) — recurrence pairs better with PILON FFN |
 | Phase D: Reasoning Integration | :hourglass: | R1-style inference-time reasoning |
 
 ---
